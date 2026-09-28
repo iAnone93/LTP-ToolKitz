@@ -3,7 +3,7 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "pdf-table-placer",
+      "name": "LTP-ToolKitz",
       "dependencies": {
         "@tailwindcss/vite": "^4.2.0",
         "diff": "^9.0.0",

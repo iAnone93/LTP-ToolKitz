@@ -288,7 +288,7 @@ const PdfMerge: React.FC = () => {
             <div className="flex items-center gap-2">
               <h1 className="text-xl font-bold text-gray-800 tracking-tight">PDF Merge</h1>
               <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 font-semibold rounded-full hidden sm:inline-block">
-                v1.8.0
+                v2.0
               </span>
             </div>
             <p className="text-xs text-gray-500 hidden sm:block">Combine multiple PDF files into one in any custom order</p>

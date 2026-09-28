@@ -20,7 +20,7 @@ const env = {
     framework: 'React 18 / Vite 5 / Jest & RTL (Automated Suite)',
     browser: 'Chrome 122.0 (Headless)',
     device: 'Desktop',
-    version: '1.8.0'
+    version: '2.0.0'
 };
 
 const suites = [
