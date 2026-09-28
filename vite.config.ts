@@ -14,10 +14,18 @@ export default defineConfig({
     chunkSizeWarningLimit: 1200,
     rollupOptions: {
       output: {
-        manualChunks: {
-          'vendor-pdf': ['pdf-lib', 'pdfjs-dist'],
-          'vendor-office': ['xlsx', 'docx', 'jspdf'],
-          'vendor-json': ['ajv', 'ajv-formats', 'jsonrepair']
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (id.includes('pdf-lib') || id.includes('pdfjs-dist')) {
+              return 'vendor-pdf';
+            }
+            if (id.includes('xlsx') || id.includes('docx') || id.includes('jspdf')) {
+              return 'vendor-office';
+            }
+            if (id.includes('ajv') || id.includes('jsonrepair')) {
+              return 'vendor-json';
+            }
+          }
         }
       }
     }

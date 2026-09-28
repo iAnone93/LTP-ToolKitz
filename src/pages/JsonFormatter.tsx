@@ -469,7 +469,10 @@ const JsonFormatter: React.FC = () => {
         ajvInstance = new Ajv({ allErrors: true, strict: false });
       }
 
-      addFormats(ajvInstance);
+      const addFormatsFn = typeof addFormats === 'function' ? addFormats : (addFormats as any)?.default;
+      if (typeof addFormatsFn === 'function') {
+        addFormatsFn(ajvInstance);
+      }
 
       const validate = ajvInstance.compile(parsedSchema);
       const isValid = validate(jsonSyntaxStatus.parsed);
