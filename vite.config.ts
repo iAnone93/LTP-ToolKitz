@@ -9,5 +9,17 @@ export default defineConfig({
   ],
   optimizeDeps: {
     exclude: ['pdfjs-dist'] // Prevents optimization issues with pdfjs worker
+  },
+  build: {
+    chunkSizeWarningLimit: 1200,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-pdf': ['pdf-lib', 'pdfjs-dist'],
+          'vendor-office': ['xlsx', 'docx', 'jspdf'],
+          'vendor-json': ['ajv', 'ajv-formats', 'jsonrepair']
+        }
+      }
+    }
   }
 });
