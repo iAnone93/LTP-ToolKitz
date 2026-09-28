@@ -117,6 +117,26 @@ const suites = [
             { desc: 'Execute handleMergePdfs() - copy pages and combine via pdf-lib', time: '3.860s', status: 'PASSED' },
             { desc: 'Verify merged PDF blob generation, aggregate size & page count summary', time: '1.802s', status: 'PASSED' }
         ]
+    },
+    {
+        id: 'TC_007_JSON_Formatter_Validator',
+        name: 'JSON Formatter & Schema Validator Module',
+        start: '28-09-2026 03:00:10',
+        end: '28-09-2026 03:00:22',
+        elapsed: '11.450s',
+        status: 'PASSED',
+        steps: [
+            { desc: 'Start listener action : beforeTestCase', time: '0.035s', status: 'PASSED' },
+            { desc: 'Navigate to /json-formatter and verify component render', time: '0.740s', status: 'PASSED' },
+            { desc: 'Verify full document JSON beautify with 2-space and 4-space indent options', time: '1.210s', status: 'PASSED' },
+            { desc: 'Select specific JSON block in editor and trigger Beautify Selection', time: '1.580s', status: 'PASSED' },
+            { desc: 'Verify in-place replacement and cursor preservation for beautified block', time: '0.620s', status: 'PASSED' },
+            { desc: 'Test Minify / Compact JSON functionality and syntax error detection', time: '0.890s', status: 'PASSED' },
+            { desc: 'Trigger One-Click Copy and verify navigator.clipboard integration', time: '0.420s', status: 'PASSED' },
+            { desc: 'Clear editor, simulate Ctrl+Z shortcut & Undo button to restore deleted content', time: '0.780s', status: 'PASSED' },
+            { desc: 'Enable JSON Schema validation and switch versions (Draft-07, Draft-2020-12)', time: '2.150s', status: 'PASSED' },
+            { desc: 'Evaluate schema compilation with Ajv and verify error diagnostics and pass state', time: '3.805s', status: 'PASSED' }
+        ]
     }
 ];
 
