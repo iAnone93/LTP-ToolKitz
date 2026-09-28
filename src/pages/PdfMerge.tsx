@@ -286,8 +286,8 @@ const PdfMerge: React.FC = () => {
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-xl font-bold text-gray-800 tracking-tight">PDF Merge</h1>
-              <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 font-semibold rounded-full hidden sm:inline-block">
+              <h1 className="text-lg sm:text-xl font-bold text-gray-800 tracking-tight">PDF Merge</h1>
+              <span className="text-xs font-semibold px-2 py-0.5 bg-purple-50 text-purple-700 rounded-md border border-purple-200 hidden sm:inline-block">
                 v2.0
               </span>
             </div>

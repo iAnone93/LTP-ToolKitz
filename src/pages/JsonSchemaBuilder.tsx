@@ -620,7 +620,17 @@ const JsonSchemaBuilder: React.FC = () => {
           <div className="bg-blue-600 p-2 rounded-lg text-white">
             <FileJson size={20} />
           </div>
-          <h1 className="text-xl font-bold text-gray-800 tracking-tight">JSON Schema Builder</h1>
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-lg sm:text-xl font-bold text-gray-800 tracking-tight">JSON Schema Builder</h1>
+              <span className="text-xs font-semibold px-2 py-0.5 bg-blue-50 text-blue-700 rounded-md border border-blue-200 hidden sm:inline-block">
+                v2.0
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 hidden sm:block">
+              Generate, customize, and export Draft-07 JSON Schemas from raw JSON payloads
+            </p>
+          </div>
         </div>
         <div className="flex items-center gap-3">
           <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer mr-2" title="Automatically extract enum values from array items">

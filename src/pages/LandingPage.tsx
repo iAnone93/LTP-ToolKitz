@@ -15,12 +15,12 @@ import {
   X
 } from 'lucide-react';
 
-type ToolCategory = 'all' | 'pdf' | 'json' | 'conversion';
+type ToolCategory = 'all' | 'pdf' | 'json' | 'utilities';
 
 interface ToolItem {
   id: string;
   name: string;
-  category: 'pdf' | 'json' | 'conversion';
+  category: 'pdf' | 'json' | 'utilities';
   categoryLabel: string;
   badge?: string;
   description: string;
@@ -38,7 +38,7 @@ const CATEGORIES: { id: ToolCategory; label: string; icon: React.ReactNode; coun
   { id: 'all', label: 'All Tools', icon: <SlidersHorizontal size={16} /> },
   { id: 'pdf', label: 'PDF Tools', icon: <Layers size={16} /> },
   { id: 'json', label: 'JSON Tools', icon: <Code size={16} /> },
-  { id: 'conversion', label: 'Converters', icon: <FileOutput size={16} /> },
+  { id: 'utilities', label: 'Other Utilities', icon: <Wrench size={16} /> },
 ];
 
 const tools: ToolItem[] = [
@@ -123,12 +123,12 @@ const tools: ToolItem[] = [
     features: ['Side-by-side diff view', 'Inline value differences', 'Deep key matching', 'Summary statistics']
   },
 
-  // Document & Conversion Suite
+  // Other Utilities Suite
   {
     id: 'document-converter',
     name: 'Document Converter',
-    category: 'conversion',
-    categoryLabel: 'Converters',
+    category: 'utilities',
+    categoryLabel: 'Other Utilities',
     description: 'Convert document formats between PDF, Word, Excel, and structured plain-text files quickly.',
     icon: <FileOutput className="w-7 h-7 text-amber-600" />,
     path: '/document-converter',
@@ -142,7 +142,7 @@ const tools: ToolItem[] = [
   {
     id: 'more-tools',
     name: 'More Utilities',
-    category: 'conversion',
+    category: 'utilities',
     categoryLabel: 'In Pipeline',
     badge: 'Coming Soon',
     description: 'Additional automated QA and workflow utilities are being built to simplify daily productivity.',
@@ -175,7 +175,7 @@ const LandingPage: React.FC = () => {
 
   const pdfTools = useMemo(() => tools.filter(t => t.category === 'pdf'), []);
   const jsonTools = useMemo(() => tools.filter(t => t.category === 'json'), []);
-  const conversionTools = useMemo(() => tools.filter(t => t.category === 'conversion'), []);
+  const utilitiesTools = useMemo(() => tools.filter(t => t.category === 'utilities'), []);
 
   const getCategoryCount = (category: ToolCategory) => {
     if (category === 'all') return tools.filter(t => t.available).length;
@@ -198,7 +198,7 @@ const LandingPage: React.FC = () => {
                   v2.0
                 </span>
               </div>
-              <p className="text-xs text-slate-500 hidden sm:block">Productivity suite for PDF & JSON operations</p>
+              <p className="text-xs text-slate-500 hidden sm:block">Productivity suite for PDF, JSON & other utilities</p>
             </div>
           </div>
 
@@ -219,11 +219,11 @@ const LandingPage: React.FC = () => {
               JSON Tools
             </button>
             <button
-              onClick={() => { setActiveCategory('conversion'); setSearchQuery(''); }}
+              onClick={() => { setActiveCategory('utilities'); setSearchQuery(''); }}
               className="px-3 py-1.5 rounded-lg hover:bg-slate-100 hover:text-amber-600 transition-colors flex items-center gap-1.5"
             >
               <span className="w-2 h-2 rounded-full bg-amber-500"></span>
-              Converters
+              Other Utilities
             </button>
           </nav>
         </div>
@@ -236,7 +236,7 @@ const LandingPage: React.FC = () => {
             Essential Tools for Smooth Work!
           </h2>
           <p className="text-base sm:text-lg text-slate-600 max-w-2xl mx-auto mb-8">
-            High-performance browser utilities organized for fast document handling, PDF management, and JSON manipulation.
+            High-performance browser utilities organized for fast document handling, PDF management, JSON manipulation, and other daily utilities.
           </p>
 
           {/* Search & Filter Controls */}
@@ -392,26 +392,26 @@ const LandingPage: React.FC = () => {
               </div>
             </section>
 
-            {/* Section 3: Converters & Coming Soon */}
-            <section id="conversion-tools" className="scroll-mt-20">
+            {/* Section 3: Other Utilities */}
+            <section id="other-utilities" className="scroll-mt-20">
               <div className="flex items-center justify-between mb-4 border-b border-slate-200 pb-3">
                 <div className="flex items-center gap-3">
                   <div className="p-2 bg-amber-50 text-amber-700 rounded-lg border border-amber-100">
-                    <FileOutput size={20} />
+                    <Wrench size={20} />
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <h3 className="text-xl font-bold text-slate-900">Document & Conversion</h3>
+                      <h3 className="text-xl font-bold text-slate-900">Other Utilities</h3>
                       <span className="text-xs font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-100">
-                        Conversion & Utilities
+                        {utilitiesTools.length} Utilities
                       </span>
                     </div>
-                    <p className="text-xs text-slate-500">Transform formats and explore upcoming testing utilities</p>
+                    <p className="text-xs text-slate-500">Document conversion and additional daily productivity tools</p>
                   </div>
                 </div>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {conversionTools.map((tool) => (
+                {utilitiesTools.map((tool) => (
                   <ToolCard key={tool.id} tool={tool} />
                 ))}
               </div>

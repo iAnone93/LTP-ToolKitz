@@ -54,7 +54,17 @@ const JsonCompare: React.FC = () => {
           <div className="bg-rose-600 p-2 rounded-lg text-white">
             <GitCompare size={20} />
           </div>
-          <h1 className="text-xl font-bold text-gray-800 tracking-tight">JSON Compare</h1>
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-lg sm:text-xl font-bold text-gray-800 tracking-tight">JSON Compare</h1>
+              <span className="text-xs font-semibold px-2 py-0.5 bg-rose-50 text-rose-700 rounded-md border border-rose-200 hidden sm:inline-block">
+                v2.0
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 hidden sm:block">
+              Compare two JSON payloads side-by-side with visual semantic difference highlighting
+            </p>
+          </div>
         </div>
         <div className="flex items-center gap-3">
           <button 

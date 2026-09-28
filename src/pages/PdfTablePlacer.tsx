@@ -198,10 +198,17 @@ const PdfTablePlacer: React.FC = () => {
           <div className="bg-indigo-600 p-2 rounded-lg text-white">
             <Layout size={20} />
           </div>
-          <h1 className="text-xl font-bold text-gray-800 tracking-tight truncate">PDF Sign & Table Placer</h1>
-        </div>
-        <div className="text-sm text-gray-500 hidden sm:block">
-          v2.0
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-lg sm:text-xl font-bold text-gray-800 tracking-tight">PDF Sign & Table Placer</h1>
+              <span className="text-xs font-semibold px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-md border border-indigo-200 hidden sm:inline-block">
+                v2.0
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 hidden sm:block">
+              Upload PDF, customize table grid coordinates, and place electronic signatures
+            </p>
+          </div>
         </div>
       </header>
 
