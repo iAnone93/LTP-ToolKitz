@@ -33,6 +33,17 @@
   - Custom page ranges, individual page rotation (90°/180°/270°), and selective extraction.
   - Combine multiple documents into a single consolidated PDF in seconds.
 
+- **PDF Sensitive Data Redactor (`/pdf-redactor`)** *(New in v2.1)*
+  - **Automated PII & Network Sanitization**: Built-in detection rules for Email Addresses, Phone Numbers, Credit Cards/Bank Accounts, Identity/SSN/NIK, Currency & Balances, **IPv4 Addresses & Ports** (e.g., `10.0.0.1:1315`), and **URLs & Server Endpoints**.
+  - **Automatic & Manual Image Redaction**:
+    - Automatically scans the PDF operator stream to detect and blackout embedded photos, signatures, company seals, and raster images (both portrait and landscape transforms).
+    - Interactive **Draw Image / Area Blackout** mode to click-and-drag custom redaction rectangles over any visual element on the page.
+  - **Quick Custom Regex Rule from PDF Selection**: Highlight any sample text directly on the PDF preview canvas to open the floating **"Pick one that you want."** multi-tier visual pattern picker, then click **OK** to add it directly to your active detection rules.
+  - **3-Tab Compact Inspector & Direct Page Jump**:
+    - Dedicated **Regex Rules**, **Audit Matches** (with All Pages / Current Page scope filter and search), and **Redact Style** tabs.
+    - Editable pagination input (`[ 1 ] / N`) — type a page number and press <kbd>Enter</kbd> to jump directly to any page.
+  - **Flexible Replacement Styles**: Export redacted PDFs using customizable **Text Badges** (e.g., `[CONFIDENTIAL]` in Dark Slate, Red Tint, or Black themes), **Solid Blackout**, or **Whiteout**.
+
 ---
 
 ### 🧩 JSON Utilities
@@ -57,6 +68,18 @@
 ---
 
 ### 🛠️ Other Utilities
+- **Data Compare & Multi-Diff (`/data-compare`)** *(New in v2.1)*
+  - **Code & Automation Scripts**: Side-by-side and unified diffing with syntax support for **Groovy (Katalon Studio test scripts & custom keywords)**, **SQL (DDL schemas & migrations)**, **JavaScript/TypeScript**, **Python**, **Java**, **JSON**, **XML/HTML**, and **Bash**.
+  - **Excel & CSV Spreadsheets**: Cell-level and row-level visual comparison (`.xlsx`, `.xls`, `.csv`) with optional primary-key matching and change counters (Added, Removed, Modified, Unchanged rows).
+  - **PDF Document Revisions**: Extracts and compares text across multi-page PDF document revisions (`pdfjs-dist`).
+  - **Text & Paragraphs**: Prose, requirements, and release note comparison with ignore-whitespace, ignore-case, word-wrap toggles, pre-loaded sample placeholders, and one-click **Copy Summary Report** for PRs or QA test evidence.
+
+- **Regex Live Tester & Builder (`/regex-live-tester`)** *(New in v2.1)*
+  - **Real-Time Live Tester**: Instant regular expression evaluation with yellow inline match highlighting, group capture inspection, and ReDoS loop protection.
+  - **Interactive Multi-Tier Pattern Builder**: Paste any log line, URL, or string to inspect stacked visual pattern tiers under each character (ISO timestamps, dates, IPv4 + Port, Web URLs, numbers, words, symbols) and click to synthesize regex rules automatically.
+  - **Substitution & Multi-Language Code Generator**: Live search-and-replace preview (`$&`, `$1`) and ready-to-copy regex snippets for **Katalon / Groovy**, **JavaScript / TypeScript**, **Python**, **Java**, **Go**, **C#**, and **PHP**.
+  - **Preset Library & Cheatsheet**: Curated starter templates and interactive quick-insert regex tokens.
+
 - **Base64 Encoder / Decoder (`/base64-converter`)**
   - **Text & Code Strings**: Instant bi-directional encoding and decoding between plain text, UTF-8 strings, and Base64.
   - **Images & Documents (PDF, Word, Excel)**:
@@ -73,8 +96,7 @@
 
 - **Pipeline (Coming Soon)**:
   - CSV to JSON transformer
-  - Regex live evaluation tester
-  - UUID & hash generator
+  - UUID & cryptographic hash generator
 
 ---
 
