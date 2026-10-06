@@ -14,7 +14,7 @@
 
 ## 🌟 Overview
 
-**LTP-ToolKitz** is an all-in-one browser toolkit crafted for software engineers, QA automation professionals, data analysts, and technical leads. All operations (parsing, rendering, converting, and schema validation) execute directly within your browser session using Web APIs and WebAssembly. Your documents and data never leave your computer.
+**LTP-ToolKitz** is an all-in-one browser toolkit crafted for software engineers, QA automation professionals, data analysts, and technical leads. All operations (parsing, rendering, converting, and schema validation) execute directly within your browser session using Web APIs and WebAssembly. Your documents and data **never leave your computer**.
 
 ---
 
