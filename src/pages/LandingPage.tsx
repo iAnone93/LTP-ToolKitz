@@ -83,8 +83,8 @@ const tools: ToolItem[] = [
     name: 'PDF Sensitive Data Redactor',
     category: 'pdf',
     categoryLabel: 'PDF Suite',
-    badge: 'PII Sanitizer',
-    description: 'Detect and redact sensitive data (emails, phones, credit cards, SSN, and custom regex) with [CONFIDENTIAL] labels or blackout bars.',
+    badge: 'OCR + PII Sanitizer',
+    description: 'Automatically detect & redact sensitive PDF text and in-image form inputs via dual-pass OCR, with full-resolution image extraction and local PDF attachments.',
     icon: <ShieldAlert className="w-7 h-7 text-rose-600" />,
     path: '/pdf-redactor',
     cardBg: 'bg-white',
@@ -92,7 +92,7 @@ const tools: ToolItem[] = [
     hoverBorder: 'hover:border-rose-400 hover:shadow-rose-50/50',
     accentColor: 'text-rose-600',
     available: true,
-    features: ['Auto PII pattern detection', 'Custom regex rules', '[CONFIDENTIAL] badge stamping', 'Solid blackout / whiteout', '100% private browser processing']
+    features: ['Auto In-Image OCR & Form Input Redaction', 'Full-resolution uncropped image preview', 'Auto PII & custom regex detection', 'Local full-size PDF attachment page']
   },
 
   // JSON Suite
@@ -419,7 +419,7 @@ const LandingPage: React.FC = () => {
                     <div className="flex items-center gap-2">
                       <h3 className="text-xl font-bold text-slate-900">PDF Suite</h3>
                       <span className="text-xs font-semibold text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full border border-purple-100">
-                        2 Tools
+                        {pdfTools.length} Tools
                       </span>
                     </div>
                     <p className="text-xs text-slate-500">Edit, stitch, stamp, and organize PDF documents in-browser</p>

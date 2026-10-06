@@ -13,7 +13,11 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  resolve: {
+    dedupe: ['react', 'react-dom', 'react-router-dom'],
+  },
   optimizeDeps: {
+    include: ['react', 'react-dom', 'react-router-dom', 'tesseract.js'],
     exclude: ['pdfjs-dist'] // Prevents optimization issues with pdfjs worker
   },
   build: {
@@ -24,6 +28,9 @@ export default defineConfig({
           if (id.includes('node_modules')) {
             if (id.includes('pdfjs-dist')) {
               return 'vendor-pdfjs';
+            }
+            if (id.includes('tesseract')) {
+              return 'vendor-ocr';
             }
             if (id.includes('pdf-lib') || id.includes('@pdf-lib')) {
               return 'vendor-pdflib';

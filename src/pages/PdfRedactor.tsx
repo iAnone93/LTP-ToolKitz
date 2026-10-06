@@ -16,18 +16,28 @@ import {
   ImageOff,
   X,
   Wand2,
-  ListChecks
+  ListChecks,
+  ScanText,
+  ExternalLink,
+  Eye,
+  CheckCircle2,
+  FileImage
 } from 'lucide-react';
 import {
   RedactionRule,
   DetectedMatch,
+  InImageSubBox,
   RedactionStyleOptions,
   ExtractedTextItem,
   DEFAULT_REDACTION_RULES,
   scanPdfForSensitiveData,
   applyRedactionsToPdf,
   createDemoConfidentialPdf,
-  parseUserRegexInput
+  parseUserRegexInput,
+  autoScanImagesWithOcr,
+  evaluateOcrLinesAgainstRules,
+  renderSanitizedImageWithSubBoxes,
+  getOrCreateOcrWorker
 } from '../utils/pdfRedactor';
 import { generateMultiTierSuggestions, escapeRegex } from '../utils/regexGenerator';
 import { TokenSuggestion } from '../types/regex';
@@ -131,6 +141,17 @@ const PdfRedactor: React.FC = () => {
   const [dragBox, setDragBox] = useState<{ startX: number; startY: number; currX: number; currY: number } | null>(null);
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [scanProgress, setScanProgress] = useState<{ current: number; total: number } | null>(null);
+  const [ocrStatusText, setOcrStatusText] = useState<string | null>(null);
+
+  // In-Image OCR & Local Full-Size View Modal State
+  const [activeImageModalId, setActiveImageModalId] = useState<string | null>(null);
+  const [modalDragBox, setModalDragBox] = useState<{
+    startX: number;
+    startY: number;
+    currX: number;
+    currY: number;
+  } | null>(null);
+  const imageOcrCacheRef = useRef<Map<string, Partial<DetectedMatch>>>(new Map());
 
   // Page Text Layer & Quick Custom Regex Popup State
   const [pageTextItems, setPageTextItems] = useState<ExtractedTextItem[]>([]);
@@ -161,9 +182,20 @@ const PdfRedactor: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [renderedViewport, setRenderedViewport] = useState<{ width: number; height: number } | null>(null);
 
-  // Load Demo PDF on initial mount so user has immediate preview
+  const getImageCacheKey = (m: DetectedMatch) =>
+    `${m.pageIndex}:${Math.round(m.x)}:${Math.round(m.y)}:${Math.round(m.width)}:${Math.round(m.height)}`;
+
+  // Clear OCR cache when a new PDF buffer is loaded
+  useEffect(() => {
+    imageOcrCacheRef.current.clear();
+    setActiveImageModalId(null);
+  }, [pdfBuffer]);
+
+  // Load Demo PDF on initial mount and pre-warm the singleton Tesseract OCR worker
   useEffect(() => {
     let isMounted = true;
+    // Pre-warm OCR worker in background
+    getOrCreateOcrWorker().catch(() => {});
     (async () => {
       try {
         const demoBuffer = await createDemoConfidentialPdf();
@@ -180,7 +212,7 @@ const PdfRedactor: React.FC = () => {
     };
   }, []);
 
-  // When PDF buffer changes, scan with active rules
+  // When PDF buffer or rules change, scan PDF text & images + run automated OCR on embedded images
   useEffect(() => {
     if (!pdfBuffer) return;
 
@@ -196,10 +228,98 @@ const PdfRedactor: React.FC = () => {
             if (!isCancelled) setScanProgress({ current: curr, total: tot });
           }
         );
-        if (!isCancelled) {
-          setDetectedMatches(matches);
-          setNumPages(pagesCount);
-          if (currentPage >= pagesCount) setCurrentPage(0);
+
+        if (isCancelled) return;
+
+        // Hydrate any embedded images that already have cached OCR results,
+        // and re-evaluate their rawOcrLines against the current active Regex Rules!
+        const hydratedMatches = await Promise.all(
+          matches.map(async m => {
+            if (m.ruleId === 'embedded_images') {
+              const cacheKey = getImageCacheKey(m);
+              const cached = imageOcrCacheRef.current.get(cacheKey);
+              if (cached) {
+                if (
+                  cached.rawOcrLines &&
+                  cached.originalImageDataUrl &&
+                  cached.imagePixelWidth &&
+                  cached.imagePixelHeight
+                ) {
+                  const reEvaluatedSubBoxes = evaluateOcrLinesAgainstRules(
+                    cached.rawOcrLines,
+                    rules,
+                    cached.imagePixelWidth,
+                    cached.imagePixelHeight,
+                    cached.subBoxes
+                  );
+                  const freshRedactedUrl = await renderSanitizedImageWithSubBoxes(
+                    cached.originalImageDataUrl,
+                    reEvaluatedSubBoxes,
+                    redactionOptions
+                  );
+                  const updatedCache: Partial<DetectedMatch> = {
+                    ...cached,
+                    subBoxes: reEvaluatedSubBoxes,
+                    redactedImageDataUrl: freshRedactedUrl
+                  };
+                  imageOcrCacheRef.current.set(cacheKey, updatedCache);
+                  return { ...m, ...updatedCache };
+                }
+                return { ...m, ...cached };
+              }
+            }
+            return m;
+          })
+        );
+
+        setDetectedMatches(hydratedMatches);
+        setNumPages(pagesCount);
+        if (currentPage >= pagesCount) setCurrentPage(0);
+
+        // Automatically run OCR on any newly detected embedded images
+        const uncachedImages = hydratedMatches.filter(
+          m => m.ruleId === 'embedded_images' && !m.subBoxes
+        );
+
+        if (uncachedImages.length > 0) {
+          setOcrStatusText(`Auto-OCR scanning ${uncachedImages.length} embedded image(s)...`);
+          const ocrUpdates = await autoScanImagesWithOcr(
+            pdfBuffer,
+            uncachedImages,
+            rules,
+            redactionOptions,
+            status => {
+              if (!isCancelled) setOcrStatusText(status);
+            },
+            (matchId, partial) => {
+              if (isCancelled) return;
+              setDetectedMatches(prev =>
+                prev.map(m => {
+                  if (m.id === matchId) {
+                    const next = { ...m, ...partial };
+                    if (partial.subBoxes) {
+                      imageOcrCacheRef.current.set(getImageCacheKey(m), partial);
+                    }
+                    return next;
+                  }
+                  return m;
+                })
+              );
+            }
+          );
+
+          if (!isCancelled && Object.keys(ocrUpdates).length > 0) {
+            setDetectedMatches(prev =>
+              prev.map(m => {
+                const upd = ocrUpdates[m.id];
+                if (upd) {
+                  imageOcrCacheRef.current.set(getImageCacheKey(m), upd);
+                  return { ...m, ...upd };
+                }
+                return m;
+              })
+            );
+          }
         }
       } catch (err) {
         console.error('Scanning error', err);
@@ -207,6 +327,7 @@ const PdfRedactor: React.FC = () => {
         if (!isCancelled) {
           setIsScanning(false);
           setScanProgress(null);
+          setOcrStatusText(null);
         }
       }
     };
@@ -217,6 +338,54 @@ const PdfRedactor: React.FC = () => {
       isCancelled = true;
     };
   }, [pdfBuffer, rules]);
+
+  // Re-composite live sanitized image previews whenever Redact Style options change
+  useEffect(() => {
+    let isCancelled = false;
+    const updateImageStyles = async () => {
+      const imgMatches = detectedMatches.filter(
+        m => m.ruleId === 'embedded_images' && m.originalImageDataUrl
+      );
+      if (imgMatches.length === 0) return;
+
+      const updatedMap: Record<string, string> = {};
+      for (const m of imgMatches) {
+        const freshUrl = await renderSanitizedImageWithSubBoxes(
+          m.originalImageDataUrl!,
+          m.subBoxes || [],
+          redactionOptions
+        );
+        updatedMap[m.id] = freshUrl;
+      }
+
+      if (!isCancelled) {
+        setDetectedMatches(prev =>
+          prev.map(m => {
+            if (updatedMap[m.id]) {
+              const updated = { ...m, redactedImageDataUrl: updatedMap[m.id] };
+              imageOcrCacheRef.current.set(getImageCacheKey(m), {
+                originalImageDataUrl: updated.originalImageDataUrl,
+                redactedImageDataUrl: updated.redactedImageDataUrl,
+                imagePixelWidth: updated.imagePixelWidth,
+                imagePixelHeight: updated.imagePixelHeight,
+                rawOcrLines: updated.rawOcrLines,
+                subBoxes: updated.subBoxes,
+                imageMode: updated.imageMode,
+                createLocalFullSizePage: updated.createLocalFullSizePage
+              });
+              return updated;
+            }
+            return m;
+          })
+        );
+      }
+    };
+
+    updateImageStyles();
+    return () => {
+      isCancelled = true;
+    };
+  }, [redactionOptions]);
 
   // Render current PDF page onto Canvas
   useEffect(() => {
@@ -505,6 +674,162 @@ const PdfRedactor: React.FC = () => {
     if (e) e.stopPropagation();
     setManualMatches(prev => prev.filter(m => m.id !== matchId));
   };
+
+  // Helper to update an embedded image match and re-composite its sanitized image DataURL
+  const updateEmbeddedImageMatch = async (
+    matchId: string,
+    updater: (m: DetectedMatch) => DetectedMatch
+  ) => {
+    const target = detectedMatches.find(m => m.id === matchId);
+    if (!target) return;
+    const nextMatch = updater(target);
+
+    if (nextMatch.originalImageDataUrl) {
+      nextMatch.redactedImageDataUrl = await renderSanitizedImageWithSubBoxes(
+        nextMatch.originalImageDataUrl,
+        nextMatch.subBoxes || [],
+        redactionOptions
+      );
+    }
+
+    imageOcrCacheRef.current.set(getImageCacheKey(nextMatch), {
+      originalImageDataUrl: nextMatch.originalImageDataUrl,
+      redactedImageDataUrl: nextMatch.redactedImageDataUrl,
+      imagePixelWidth: nextMatch.imagePixelWidth,
+      imagePixelHeight: nextMatch.imagePixelHeight,
+      rawOcrLines: nextMatch.rawOcrLines,
+      subBoxes: nextMatch.subBoxes,
+      imageMode: nextMatch.imageMode,
+      createLocalFullSizePage: nextMatch.createLocalFullSizePage
+    });
+
+    setDetectedMatches(prev => prev.map(m => (m.id === matchId ? nextMatch : m)));
+  };
+
+  const handleToggleImageSubBox = (matchId: string, subBoxId: string) => {
+    updateEmbeddedImageMatch(matchId, m => ({
+      ...m,
+      subBoxes: (m.subBoxes || []).map(b =>
+        b.id === subBoxId ? { ...b, selected: !b.selected } : b
+      )
+    }));
+  };
+
+  const handleDeleteImageSubBox = (matchId: string, subBoxId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    updateEmbeddedImageMatch(matchId, m => ({
+      ...m,
+      subBoxes: (m.subBoxes || []).filter(b => b.id !== subBoxId)
+    }));
+  };
+
+  const handleSetAllImageSubBoxes = (matchId: string, selected: boolean) => {
+    updateEmbeddedImageMatch(matchId, m => ({
+      ...m,
+      subBoxes: (m.subBoxes || []).map(b => ({ ...b, selected }))
+    }));
+  };
+
+  const handleRedactOnlyInputValues = (matchId: string) => {
+    updateEmbeddedImageMatch(matchId, m => ({
+      ...m,
+      subBoxes: (m.subBoxes || []).map(b => ({
+        ...b,
+        selected: b.fieldType === 'input_value' || b.id.startsWith('custom-')
+      }))
+    }));
+  };
+
+  const handleChangeImageMode = (matchId: string, imageMode: 'partial' | 'full_blackout') => {
+    updateEmbeddedImageMatch(matchId, m => ({
+      ...m,
+      imageMode,
+      selected: true
+    }));
+  };
+
+  const handleToggleLocalFullSizePage = (matchId: string) => {
+    updateEmbeddedImageMatch(matchId, m => ({
+      ...m,
+      createLocalFullSizePage: m.createLocalFullSizePage === false ? true : false
+    }));
+  };
+
+  const handleRescanSingleImageOcr = async (match: DetectedMatch) => {
+    if (!pdfBuffer) return;
+    setOcrStatusText('Re-scanning image text with OCR...');
+    try {
+      const updates = await autoScanImagesWithOcr(
+        pdfBuffer,
+        [match],
+        rules,
+        redactionOptions,
+        status => setOcrStatusText(status)
+      );
+      const upd = updates[match.id];
+      if (upd) {
+        imageOcrCacheRef.current.set(getImageCacheKey(match), upd);
+        setDetectedMatches(prev =>
+          prev.map(m => (m.id === match.id ? { ...m, ...upd } : m))
+        );
+      }
+    } finally {
+      setOcrStatusText(null);
+    }
+  };
+
+  // Mouse handlers for drawing custom redaction boxes inside the Full-Size Image Modal
+  const handleModalImageMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setModalDragBox({ startX: x, startY: y, currX: x, currY: y });
+  };
+
+  const handleModalImageMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!modalDragBox) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    const y = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+    setModalDragBox(prev => (prev ? { ...prev, currX: x, currY: y } : null));
+  };
+
+  const handleModalImageMouseUp = (
+    e: React.MouseEvent<HTMLDivElement>,
+    match: DetectedMatch
+  ) => {
+    if (!modalDragBox) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const leftPx = Math.min(modalDragBox.startX, modalDragBox.currX);
+    const topPx = Math.min(modalDragBox.startY, modalDragBox.currY);
+    const widthPx = Math.abs(modalDragBox.currX - modalDragBox.startX);
+    const heightPx = Math.abs(modalDragBox.currY - modalDragBox.startY);
+
+    if (widthPx >= 8 && heightPx >= 8 && rect.width > 0 && rect.height > 0) {
+      const newSubBox: InImageSubBox = {
+        id: `custom-in-img-${Date.now()}`,
+        label: `Custom Drawn Region #${(match.subBoxes?.length || 0) + 1}`,
+        ruleName: 'Manual In-Image Box',
+        xRatio: leftPx / rect.width,
+        yRatio: topPx / rect.height,
+        wRatio: widthPx / rect.width,
+        hRatio: heightPx / rect.height,
+        selected: true
+      };
+      updateEmbeddedImageMatch(match.id, m => ({
+        ...m,
+        imageMode: 'partial',
+        subBoxes: [...(m.subBoxes || []), newSubBox]
+      }));
+    }
+    setModalDragBox(null);
+  };
+
+  // Active Embedded Image Match for the Local Full-Size & OCR Popup Modal
+  const activeImageModalMatch = useMemo(() => {
+    if (!activeImageModalId) return null;
+    return detectedMatches.find(m => m.id === activeImageModalId) || null;
+  }, [activeImageModalId, detectedMatches]);
 
   // Select / Deselect all matches
   const handleToggleSelectAll = (select: boolean) => {
@@ -977,13 +1302,17 @@ const PdfRedactor: React.FC = () => {
                 ) : (
                   filteredSidebarMatches.map((m) => {
                     const isManual = m.id.startsWith('manual-');
+                    const isEmbeddedImg = m.ruleId === 'embedded_images';
+                    const activeOcrCount = (m.subBoxes || []).filter(b => b.selected).length;
+                    const totalOcrCount = (m.subBoxes || []).length;
+
                     return (
                       <div
                         key={m.id}
                         onClick={() => handleToggleMatch(m.id)}
                         className={`p-2 rounded-xl border text-xs flex items-center justify-between cursor-pointer transition-all ${
                           m.selected
-                            ? isManual
+                            ? isManual || isEmbeddedImg
                               ? 'bg-indigo-50/70 border-indigo-200 text-slate-900'
                               : 'bg-rose-50/70 border-rose-200 text-slate-900'
                             : 'bg-slate-50 border-slate-200 text-slate-400 opacity-60'
@@ -1000,7 +1329,7 @@ const PdfRedactor: React.FC = () => {
                             <span className="font-mono font-bold block truncate text-slate-900">
                               {m.matchedText}
                             </span>
-                            <div className="flex items-center gap-1.5 text-[10px] text-slate-500">
+                            <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500">
                               <span className="truncate">{m.ruleName}</span>
                               <span>•</span>
                               <button
@@ -1013,11 +1342,35 @@ const PdfRedactor: React.FC = () => {
                               >
                                 Page {m.pageIndex + 1}
                               </button>
+                              {isEmbeddedImg && (
+                                <>
+                                  <span>•</span>
+                                  <span className="text-emerald-700 font-semibold">
+                                    {m.imageMode === 'full_blackout'
+                                      ? 'Full Blackout'
+                                      : `${activeOcrCount}/${totalOcrCount} OCR fields`}
+                                  </span>
+                                </>
+                              )}
                             </div>
                           </div>
                         </div>
 
                         <div className="flex items-center gap-1.5 shrink-0">
+                          {isEmbeddedImg && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setCurrentPage(m.pageIndex);
+                                setActiveImageModalId(m.id);
+                              }}
+                              className="px-2 py-0.5 rounded bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-bold flex items-center gap-1 shadow-2xs transition-colors"
+                              title="Open full-size local image & inspect OCR redactions"
+                            >
+                              <Eye size={10} />
+                              <span>OCR / View</span>
+                            </button>
+                          )}
                           <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-white border border-slate-200">
                             {m.selected ? 'Will Redact' : 'Excluded'}
                           </span>
@@ -1195,7 +1548,16 @@ const PdfRedactor: React.FC = () => {
               {isScanning && (
                 <div className="flex items-center gap-1.5 px-2 py-0.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-full text-[10px] font-semibold">
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping" />
-                  <span>Scanning {scanProgress ? `page ${scanProgress.current}/${scanProgress.total}` : '...'}</span>
+                  <span>
+                    {ocrStatusText ||
+                      `Scanning ${scanProgress ? `page ${scanProgress.current}/${scanProgress.total}` : '...'}`}
+                  </span>
+                </div>
+              )}
+              {!isScanning && ocrStatusText && (
+                <div className="flex items-center gap-1.5 px-2 py-0.5 bg-indigo-50 text-indigo-800 border border-indigo-200 rounded-full text-[10px] font-semibold">
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-ping" />
+                  <span>{ocrStatusText}</span>
                 </div>
               )}
             </div>
@@ -1411,6 +1773,13 @@ const PdfRedactor: React.FC = () => {
                 const width = m.width * zoomScale;
                 const height = m.height * zoomScale;
                 const isManual = m.id.startsWith('manual-');
+                const isEmbeddedImg = m.ruleId === 'embedded_images';
+                const isPartialImage =
+                  isEmbeddedImg &&
+                  m.selected &&
+                  m.imageMode === 'partial' &&
+                  Boolean(m.redactedImageDataUrl);
+                const activeOcrCount = (m.subBoxes || []).filter(b => b.selected).length;
 
                 return (
                   <div
@@ -1418,7 +1787,11 @@ const PdfRedactor: React.FC = () => {
                     onClick={(e) => {
                       if (isDrawMode) return;
                       e.stopPropagation();
-                      handleToggleMatch(m.id);
+                      if (isEmbeddedImg) {
+                        setActiveImageModalId(m.id);
+                      } else {
+                        handleToggleMatch(m.id);
+                      }
                     }}
                     style={{
                       position: 'absolute',
@@ -1430,14 +1803,61 @@ const PdfRedactor: React.FC = () => {
                     className={`z-20 transition-all flex items-center justify-center select-none group border-2 ${
                       isDrawMode ? 'pointer-events-none' : 'cursor-pointer'
                     } ${
-                      m.selected
-                        ? isManual
+                      isPartialImage
+                        ? 'bg-white border-indigo-600 shadow-md ring-2 ring-indigo-500/20'
+                        : m.selected
+                        ? isManual || isEmbeddedImg
                           ? 'bg-slate-900/75 border-indigo-600 shadow-sm'
                           : 'bg-rose-500/25 border-rose-600 shadow-sm'
                         : 'bg-slate-400/20 border-slate-400/50 hover:bg-rose-400/30'
                     }`}
-                    title={`${m.ruleName}: "${m.matchedText}" — Click to ${m.selected ? 'exclude' : 'redact'}`}
+                    title={
+                      isEmbeddedImg
+                        ? `${m.matchedText} — Click to open Local Full-Size View & edit OCR redactions`
+                        : `${m.ruleName}: "${m.matchedText}" — Click to ${m.selected ? 'exclude' : 'redact'}`
+                    }
                   >
+                    {/* Live Sanitized Readable Image Preview (Sensitive fields inside image redacted via OCR) */}
+                    {isPartialImage && m.redactedImageDataUrl && (
+                      <img
+                        src={m.redactedImageDataUrl}
+                        alt="Sanitized Embedded Image Preview"
+                        className="w-full h-full object-contain bg-slate-50 pointer-events-none select-none"
+                      />
+                    )}
+
+                    {/* Top-left OCR / Local Popup badge for embedded images */}
+                    {isEmbeddedImg && !isDrawMode && (
+                      <div className="absolute -top-6 left-0 flex items-center gap-1 px-2 py-0.5 rounded-md bg-indigo-700 text-white text-[9px] font-bold shadow-md whitespace-nowrap">
+                        <ScanText size={10} />
+                        <span>
+                          {m.selected
+                            ? m.imageMode === 'full_blackout'
+                              ? 'Full Image Blackout • Click to Edit'
+                              : `OCR Redacted (${activeOcrCount}) • Click to Popup`
+                            : 'Image Excluded • Click to Inspect'}
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Quick Include/Exclude toggle button in top-right corner for embedded images */}
+                    {isEmbeddedImg && !isDrawMode && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggleMatch(m.id);
+                        }}
+                        className={`absolute -top-2.5 -right-2.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold shadow-md opacity-0 group-hover:opacity-100 transition-opacity ${
+                          m.selected
+                            ? 'bg-slate-900 text-white hover:bg-rose-600'
+                            : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                        }`}
+                        title={m.selected ? 'Exclude this image from redaction' : 'Include this image in redaction'}
+                      >
+                        {m.selected ? 'Exclude' : 'Include'}
+                      </button>
+                    )}
+
                     {/* Delete button on hover for manual boxes */}
                     {isManual && !isDrawMode && (
                       <button
@@ -1449,11 +1869,11 @@ const PdfRedactor: React.FC = () => {
                       </button>
                     )}
 
-                    {/* Visual Stamp preview */}
-                    {m.selected && (
+                    {/* Visual Stamp preview for non-partial-image boxes */}
+                    {m.selected && !isPartialImage && (
                       <span
                         className={`text-[9px] font-bold px-1 py-0.2 rounded shadow-2xs truncate ${
-                          isManual
+                          isManual || isEmbeddedImg
                             ? 'text-white bg-slate-900 border border-slate-700'
                             : 'text-rose-900 bg-rose-100'
                         }`}
@@ -1678,6 +2098,411 @@ const PdfRedactor: React.FC = () => {
         </main>
 
       </div>
+
+      {/* Local Full-Size Image & In-Image OCR Redactor Popup Modal */}
+      {activeImageModalMatch && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4 animate-in fade-in duration-150"
+          onClick={() => setActiveImageModalId(null)}
+        >
+          <div
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-6xl h-[92vh] flex flex-col overflow-hidden text-slate-800"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="px-5 py-3.5 bg-slate-900 text-white flex items-center justify-between gap-4 shrink-0">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="p-2 rounded-xl bg-indigo-600/30 border border-indigo-400/30 text-indigo-300 shrink-0">
+                  <FileImage size={18} />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-sm sm:text-base font-bold truncate">
+                      {activeImageModalMatch.matchedText} — Page {activeImageModalMatch.pageIndex + 1}
+                    </h2>
+                  </div>
+                  <p className="text-[11px] text-slate-300 truncate">
+                    Keep image readable while redacting sensitive fields via OCR • Saved locally inside exported PDF
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => handleRescanSingleImageOcr(activeImageModalMatch)}
+                  disabled={Boolean(ocrStatusText)}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                  title="Re-run Tesseract OCR text detection on this image"
+                >
+                  <ScanText size={13} className="text-indigo-400" />
+                  <span>{ocrStatusText ? 'Scanning OCR...' : 'Re-Scan OCR'}</span>
+                </button>
+                <button
+                  onClick={() => setActiveImageModalId(null)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                  title="Close Popup"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Body: Left Interactive Full-Size Image Canvas + Right OCR Controls */}
+            <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
+              {/* Left: Interactive Full-Size Image Viewport */}
+              <div className="flex-1 bg-slate-900/95 p-4 sm:p-6 overflow-y-auto overflow-x-auto min-h-0">
+                <div className="mx-auto mb-3 flex flex-wrap items-center justify-between gap-2 w-full max-w-2xl text-[11px] text-slate-300">
+                  <span>
+                    <strong>Tip:</strong> Click any OCR box to toggle redaction, or <strong>click &amp; drag</strong> on the image to redact a custom area.
+                  </span>
+                  <div className="flex items-center gap-2 font-mono">
+                    {activeImageModalMatch.imagePixelWidth && activeImageModalMatch.imagePixelHeight && (
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-emerald-300 border border-slate-700">
+                        Original Resolution: {activeImageModalMatch.imagePixelWidth}×{activeImageModalMatch.imagePixelHeight}px
+                      </span>
+                    )}
+                    <span className="text-indigo-300">
+                      {(activeImageModalMatch.subBoxes || []).filter(b => b.selected).length} of{' '}
+                      {(activeImageModalMatch.subBoxes || []).length} fields redacted
+                    </span>
+                  </div>
+                </div>
+
+                {activeImageModalMatch.originalImageDataUrl ? (
+                  <div className="w-full flex justify-center pb-6">
+                    <div
+                      onMouseDown={handleModalImageMouseDown}
+                      onMouseMove={handleModalImageMouseMove}
+                      onMouseUp={(e) => handleModalImageMouseUp(e, activeImageModalMatch)}
+                      onMouseLeave={() => setModalDragBox(null)}
+                      className="relative inline-block bg-white rounded-lg shadow-2xl border-2 border-slate-700 cursor-crosshair select-none"
+                    >
+                      <img
+                        src={activeImageModalMatch.originalImageDataUrl}
+                        alt="Full-Size Extracted PDF Image"
+                        style={{
+                          width: activeImageModalMatch.imagePixelWidth
+                            ? `${Math.min(activeImageModalMatch.imagePixelWidth, 640)}px`
+                            : 'auto',
+                          height: 'auto',
+                          maxHeight: 'none'
+                        }}
+                        className="block max-w-full h-auto pointer-events-none select-none rounded-md"
+                      />
+
+                    {/* Full Blackout Mode Overlay */}
+                    {activeImageModalMatch.imageMode === 'full_blackout' && (
+                      <div className="absolute inset-0 bg-neutral-950/90 flex flex-col items-center justify-center text-white p-4 text-center">
+                        <ImageOff size={28} className="text-rose-500 mb-2" />
+                        <span className="text-xs font-bold uppercase tracking-wider">
+                          Full Image Blackout Mode
+                        </span>
+                        <span className="text-[11px] text-slate-400 mt-1">
+                          Switch to &ldquo;Keep Image Readable (OCR)&rdquo; on the right to redact only specific fields inside the image.
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Interactive OCR & Custom Sub-Boxes */}
+                    {activeImageModalMatch.imageMode !== 'full_blackout' &&
+                      (activeImageModalMatch.subBoxes || []).map((box) => {
+                        return (
+                          <div
+                            key={box.id}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onMouseUp={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleToggleImageSubBox(activeImageModalMatch.id, box.id);
+                            }}
+                            style={{
+                              position: 'absolute',
+                              left: `${box.xRatio * 100}%`,
+                              top: `${box.yRatio * 100}%`,
+                              width: `${box.wRatio * 100}%`,
+                              height: `${box.hRatio * 100}%`
+                            }}
+                            className={`group transition-all flex items-center justify-center cursor-pointer rounded-xs border ${
+                              box.selected
+                                ? redactionOptions.mode === 'blackout'
+                                  ? 'bg-neutral-950 border-rose-500 text-white shadow-md'
+                                  : redactionOptions.mode === 'whiteout'
+                                  ? 'bg-white border-slate-400 text-slate-700 shadow-md'
+                                  : redactionOptions.boxColor === 'red_tint'
+                                  ? 'bg-rose-100 border-rose-600 text-rose-900 shadow-md'
+                                  : redactionOptions.boxColor === 'white'
+                                  ? 'bg-white border-slate-400 text-slate-800 shadow-md'
+                                  : redactionOptions.boxColor === 'black'
+                                  ? 'bg-black border-slate-700 text-white shadow-md'
+                                  : 'bg-slate-900 border-indigo-400 text-white shadow-md'
+                                : box.fieldType === 'input_value'
+                                ? 'bg-indigo-500/15 border-dashed border-indigo-400 hover:bg-rose-500/25 hover:border-rose-400'
+                                : 'bg-emerald-500/12 border-dashed border-emerald-400/80 hover:bg-rose-500/25 hover:border-rose-400'
+                            }`}
+                            title={`${box.ruleName}: "${box.label}"${
+                              box.pairedLabel ? ` (Input for ${box.pairedLabel})` : ''
+                            } — Click to ${box.selected ? 'keep readable' : 'redact'}`}
+                          >
+                            {box.selected && (
+                              <span className="text-[10px] sm:text-[11px] font-mono font-bold px-1.5 truncate pointer-events-none tracking-wide">
+                                {redactionOptions.mode === 'replacement_text'
+                                  ? redactionOptions.replacementText
+                                  : redactionOptions.mode === 'whiteout'
+                                  ? '[ERASED]'
+                                  : '[REDACTED]'}
+                              </span>
+                            )}
+
+                            {/* Delete button on hover */}
+                            <button
+                              onClick={(e) =>
+                                handleDeleteImageSubBox(activeImageModalMatch.id, box.id, e)
+                              }
+                              className="absolute -top-2 -right-2 w-4 h-4 rounded-full bg-rose-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-xs"
+                              title="Remove this OCR box"
+                            >
+                              <X size={9} />
+                            </button>
+                          </div>
+                        );
+                      })}
+
+                    {/* Live Drag Box for Manual In-Image Redaction */}
+                    {modalDragBox && (
+                      <div
+                        style={{
+                          position: 'absolute',
+                          left: `${Math.min(modalDragBox.startX, modalDragBox.currX)}px`,
+                          top: `${Math.min(modalDragBox.startY, modalDragBox.currY)}px`,
+                          width: `${Math.abs(modalDragBox.currX - modalDragBox.startX)}px`,
+                          height: `${Math.abs(modalDragBox.currY - modalDragBox.startY)}px`
+                        }}
+                        className="bg-rose-500/30 border-2 border-dashed border-rose-400 pointer-events-none flex items-center justify-center"
+                      >
+                        <span className="text-[9px] font-bold bg-rose-600 text-white px-1.5 py-0.5 rounded">
+                          Redact Field
+                        </span>
+                      </div>
+                    )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="p-8 rounded-xl bg-slate-800 text-slate-300 text-xs flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping" />
+                    <span>Extracting high-resolution image &amp; running OCR...</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Right: OCR Fields Inspector & Local PDF Storage Settings */}
+              <div className="w-full lg:w-96 bg-white border-t lg:border-t-0 lg:border-l border-slate-200 flex flex-col min-h-0 overflow-hidden shrink-0">
+                <div className="p-4 border-b border-slate-200 space-y-3 bg-slate-50/70">
+                  {/* Image Redaction Mode Toggle */}
+                  <div>
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 block mb-1.5">
+                      Image Sanitization Mode
+                    </span>
+                    <div className="grid grid-cols-2 gap-1.5 text-xs">
+                      <button
+                        onClick={() => handleChangeImageMode(activeImageModalMatch.id, 'partial')}
+                        className={`py-2 px-2.5 rounded-xl border font-bold text-center transition-all ${
+                          activeImageModalMatch.imageMode !== 'full_blackout'
+                            ? 'bg-indigo-50 border-indigo-300 text-indigo-900 shadow-2xs'
+                            : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        Keep Readable (OCR)
+                      </button>
+                      <button
+                        onClick={() =>
+                          handleChangeImageMode(activeImageModalMatch.id, 'full_blackout')
+                        }
+                        className={`py-2 px-2.5 rounded-xl border font-bold text-center transition-all ${
+                          activeImageModalMatch.imageMode === 'full_blackout'
+                            ? 'bg-rose-50 border-rose-300 text-rose-900 shadow-2xs'
+                            : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        Full Image Blackout
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Method C + Option 2: External URL Stripping & Clickable Local Full-Size View */}
+                  <div className="p-3 rounded-xl bg-white border border-slate-200 space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+                        <CheckCircle2 size={14} className="text-emerald-600 shrink-0" />
+                        <span>Method C: External Link Sanitized</span>
+                      </div>
+                      <span className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 text-[9px] font-bold">
+                        Stripped
+                      </span>
+                    </div>
+                    {activeImageModalMatch.linkedUri ? (
+                      <div className="text-[10px] font-mono text-slate-500 bg-slate-50 p-1.5 rounded border border-slate-200 truncate flex items-center gap-1">
+                        <ExternalLink size={10} className="text-rose-500 shrink-0" />
+                        <span className="line-through truncate">
+                          {activeImageModalMatch.linkedUri}
+                        </span>
+                      </div>
+                    ) : (
+                      <p className="text-[10px] text-slate-500">
+                        Any underlying web/server URL annotation on this image is automatically removed on export.
+                      </p>
+                    )}
+
+                    <label className="pt-1.5 border-t border-slate-100 flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={activeImageModalMatch.createLocalFullSizePage !== false}
+                        onChange={() => handleToggleLocalFullSizePage(activeImageModalMatch.id)}
+                        className="mt-0.5 rounded text-indigo-600 focus:ring-indigo-500 h-3.5 w-3.5 shrink-0"
+                      />
+                      <div className="text-[11px] leading-snug">
+                        <span className="font-bold text-slate-800 block">
+                          Option 2: Save Clickable Full-Size View Locally in PDF
+                        </span>
+                        <span className="text-slate-500 text-[10px]">
+                          Embeds the full-size redacted image as a local page inside the PDF and links this thumbnail to it (100% offline).
+                        </span>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+
+                {/* OCR Detected Text Fields List */}
+                <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+                  <div className="px-4 py-2.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-1.5 bg-white shrink-0">
+                    <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                      <ScanText size={14} className="text-indigo-600" />
+                      <span>
+                        OCR Detected Fields ({(activeImageModalMatch.subBoxes || []).length})
+                      </span>
+                    </span>
+                    <div className="flex items-center gap-1.5 text-[10px]">
+                      <button
+                        onClick={() => handleRedactOnlyInputValues(activeImageModalMatch.id)}
+                        className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 font-bold transition-colors"
+                        title="Redact all detected Form Input Values while keeping Form Labels readable"
+                      >
+                        Redact Inputs Only
+                      </button>
+                      <button
+                        onClick={() => handleSetAllImageSubBoxes(activeImageModalMatch.id, true)}
+                        className="text-indigo-600 hover:underline font-semibold"
+                      >
+                        All
+                      </button>
+                      <span className="text-slate-300">|</span>
+                      <button
+                        onClick={() => handleSetAllImageSubBoxes(activeImageModalMatch.id, false)}
+                        className="text-slate-500 hover:underline font-semibold"
+                      >
+                        None
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
+                    {(activeImageModalMatch.subBoxes || []).length === 0 ? (
+                      <div className="p-6 text-center text-xs text-slate-400 border border-dashed border-slate-200 rounded-xl">
+                        No OCR regions yet. Click &amp; drag directly on the image on the left to redact any region.
+                      </div>
+                    ) : (
+                      (activeImageModalMatch.subBoxes || []).map((box) => (
+                        <div
+                          key={box.id}
+                          onClick={() =>
+                            handleToggleImageSubBox(activeImageModalMatch.id, box.id)
+                          }
+                          className={`p-2 rounded-xl border text-xs flex items-center justify-between cursor-pointer transition-all ${
+                            box.selected
+                              ? 'bg-rose-50/70 border-rose-200 text-slate-900'
+                              : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 min-w-0 pr-2">
+                            <input
+                              type="checkbox"
+                              checked={box.selected}
+                              onChange={() => {}}
+                              className="rounded text-rose-600 focus:ring-rose-500 h-3.5 w-3.5 shrink-0"
+                            />
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono font-bold truncate text-slate-900">
+                                  {box.label}
+                                </span>
+                                {box.fieldType && (
+                                  <span
+                                    className={`text-[9px] font-bold uppercase px-1.2 py-0.2 rounded shrink-0 ${
+                                      box.fieldType === 'input_value'
+                                        ? 'bg-indigo-100 text-indigo-800 border border-indigo-200'
+                                        : box.fieldType === 'label'
+                                        ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                                        : 'bg-slate-200 text-slate-700'
+                                    }`}
+                                  >
+                                    {box.fieldType === 'input_value'
+                                      ? 'Input Value'
+                                      : box.fieldType === 'label'
+                                      ? 'Form Label'
+                                      : 'Header/Note'}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-[10px] text-slate-500 block truncate">
+                                {box.pairedLabel
+                                  ? `Paired with Label: "${box.pairedLabel}" • ${box.ruleName}`
+                                  : box.ruleName}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <span
+                              className={`text-[10px] font-bold uppercase px-1.5 py-0.5 rounded border ${
+                                box.selected
+                                  ? 'bg-rose-100 text-rose-800 border-rose-200'
+                                  : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                              }`}
+                            >
+                              {box.selected ? 'Redacted' : 'Readable'}
+                            </span>
+                            <button
+                              onClick={(e) =>
+                                handleDeleteImageSubBox(activeImageModalMatch.id, box.id, e)
+                              }
+                              className="p-1 text-slate-400 hover:text-rose-600 rounded"
+                              title="Remove box"
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* Modal Footer */}
+                <div className="p-3.5 bg-slate-50 border-t border-slate-200 flex items-center justify-between shrink-0">
+                  <span className="text-[11px] text-slate-500">
+                    Changes apply automatically to PDF preview &amp; export
+                  </span>
+                  <button
+                    onClick={() => setActiveImageModalId(null)}
+                    className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-xs transition-colors"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

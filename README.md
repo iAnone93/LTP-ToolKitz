@@ -35,14 +35,22 @@
 
 - **PDF Sensitive Data Redactor (`/pdf-redactor`)** *(New in v2.1)*
   - **Automated PII & Network Sanitization**: Built-in detection rules for Email Addresses, Phone Numbers, Credit Cards/Bank Accounts, Identity/SSN/NIK, Currency & Balances, **IPv4 Addresses & Ports** (e.g., `10.0.0.1:1315`), and **URLs & Server Endpoints**.
-  - **Automatic & Manual Image Redaction**:
-    - Automatically scans the PDF operator stream to detect and blackout embedded photos, signatures, company seals, and raster images (both portrait and landscape transforms).
-    - Interactive **Draw Image / Area Blackout** mode to click-and-drag custom redaction rectangles over any visual element on the page.
+  - **Automated In-Image OCR Redaction & Full-Resolution Image Sanitization**:
+    - **Native Full-Resolution Uncropped Image Extraction**: Automatically extracts the original full-resolution uncropped image from linked external attachment URLs (via `/api/proxy-image`), raw PDF `/XObject` & `/Pattern` (`TilingPattern`) streams (`DCTDecode` JPEG and `FlateDecode` RGB/RGBA with PNG predictor unfiltering), or unclipped high-DPI sub-viewports so portrait/landscape screenshots are never cropped into small squares.
+    - **Dual-Pass High-Sensitivity OCR (`tesseract.js`)**: Runs a persistent singleton OCR worker across two passes:
+      1. **Pass 1 (`PSM 6 - Uniform Block`)**: Captures multi-word lines, titles, and form labels on the original image.
+      2. **Pass 2 (`PSM 11 - Sparse Text` on Border-Erased Copy)**: Automatically erases horizontal/vertical form input box borders and dropdown chevrons on an offscreen working canvas so isolated single words and numbers inside bordered inputs (`LAGOA`, `14270`, `Buruh`, `Diploma 3`) are reliably detected.
+    - **Smart Form Label vs. Input Value Classifier**: Inspects pixel luminance, color saturation, and form syntax (`(*)`, colons, vertical pairing) to differentiate between:
+      - **`Input Value` (Auto-Redacted)**: Values inside white/light bordered form inputs or paired directly beneath a form label are **automatically redacted** upon scan completion.
+      - **`Form Label` & `Header / Banner` (Readable)**: Form field labels (`Nama Nasabah (*)`, `Kelurahan (*)`) and colored/blue banner headers (`Form Uji Kelayakan`, `Detail Informasi Prospek`) remain readable so document context is preserved.
+      - **Regex Rule Matching**: Evaluates active Regex Rules against OCR text lines (and pairs matched Form Labels with their corresponding Input Value beneath them), with full-coverage vertical and horizontal padding (`computeFullCoverageBox`) and 1-click **Redact Inputs Only** / manual click-and-drag box controls in the popup modal.
+    - **External Link Sanitization (`Method C`) & Clickable Local Full-Size View (`Option 2`)**: Automatically strips external server `/URI` link annotations (e.g., CloudFront/S3 links) from embedded images and embeds the sanitized full-resolution image as a local attachment page inside the exported PDF with internal `/GoTo` navigation (`<- Back to Page X`).
+    - Interactive **Draw Image / Area Blackout** mode to click-and-drag custom redaction rectangles over any visual element on the PDF page.
   - **Quick Custom Regex Rule from PDF Selection**: Highlight any sample text directly on the PDF preview canvas to open the floating **"Pick one that you want."** multi-tier visual pattern picker, then click **OK** to add it directly to your active detection rules.
   - **3-Tab Compact Inspector & Direct Page Jump**:
     - Dedicated **Regex Rules**, **Audit Matches** (with All Pages / Current Page scope filter and search), and **Redact Style** tabs.
     - Editable pagination input (`[ 1 ] / N`) — type a page number and press <kbd>Enter</kbd> to jump directly to any page.
-  - **Flexible Replacement Styles**: Export redacted PDFs using customizable **Text Badges** (e.g., `[CONFIDENTIAL]` in Dark Slate, Red Tint, or Black themes), **Solid Blackout**, or **Whiteout**.
+  - **Flexible Replacement Styles**: Export redacted PDFs using customizable **Text Badges** (e.g., `[CONFIDENTIAL]` in Dark Slate, Red Tint, White, or Black themes), **Solid Blackout**, or **Whiteout**.
 
 ---
 
@@ -107,7 +115,7 @@
 | **Frontend Framework** | [React 18](https://react.dev/) · [TypeScript 5](https://www.typescriptlang.org/) |
 | **Build & Dev Server** | [Vite 5](https://vitejs.dev/) with Dynamic Code-Splitting (`React.lazy` & `Suspense`) |
 | **Styling** | [Tailwind CSS v4](https://tailwindcss.com/) · [Lucide React Icons](https://lucide.dev/) |
-| **PDF Engine** | `pdf-lib` · `pdfjs-dist` · `jspdf` · `jspdf-autotable` |
+| **PDF & OCR Engine** | `pdf-lib` · `pdfjs-dist` · `tesseract.js` (Dual-Pass OCR) · `jspdf` · `jspdf-autotable` |
 | **JSON & Schema** | `ajv` (v8) · `ajv-formats` · `jsonrepair` · `react-diff-viewer-continued` |
 | **Office Formats** | `xlsx` (SheetJS) · `docx` · `mammoth` |
 | **Hosting & CI/CD** | GitHub Pages (`gh-pages`) |
