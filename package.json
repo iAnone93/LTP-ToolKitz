@@ -47,6 +47,7 @@
   },
   "allowScripts": {
     "esbuild": true,
-    "core-js": false
+    "core-js": false,
+    "tesseract.js": false
   }
 }
