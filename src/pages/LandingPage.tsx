@@ -12,7 +12,10 @@ import {
   Search,
   CheckCircle2,
   SlidersHorizontal,
-  X
+  X,
+  Binary,
+  Flame,
+  ShieldAlert
 } from 'lucide-react';
 
 type ToolCategory = 'all' | 'pdf' | 'json' | 'utilities';
@@ -64,7 +67,7 @@ const tools: ToolItem[] = [
     name: 'PDF Merge & Reorder',
     category: 'pdf',
     categoryLabel: 'PDF Suite',
-    badge: 'New in v2.0',
+    badge: 'New in v2.1',
     description: 'Combine multiple PDF files into a single unified document with intuitive drag-and-drop reordering.',
     icon: <Layers className="w-7 h-7 text-purple-600" />,
     path: '/pdf-merge',
@@ -74,6 +77,22 @@ const tools: ToolItem[] = [
     accentColor: 'text-purple-600',
     available: true,
     features: ['Quick first/last sorting', 'Live PDF preview modal', 'Lossless page stitching', 'Drag-to-reorder']
+  },
+  {
+    id: 'pdf-redactor',
+    name: 'PDF Sensitive Data Redactor',
+    category: 'pdf',
+    categoryLabel: 'PDF Suite',
+    badge: 'PII Sanitizer',
+    description: 'Detect and redact sensitive data (emails, phones, credit cards, SSN, and custom regex) with [CONFIDENTIAL] labels or blackout bars.',
+    icon: <ShieldAlert className="w-7 h-7 text-rose-600" />,
+    path: '/pdf-redactor',
+    cardBg: 'bg-white',
+    borderColor: 'border-slate-200',
+    hoverBorder: 'hover:border-rose-400 hover:shadow-rose-50/50',
+    accentColor: 'text-rose-600',
+    available: true,
+    features: ['Auto PII pattern detection', 'Custom regex rules', '[CONFIDENTIAL] badge stamping', 'Solid blackout / whiteout', '100% private browser processing']
   },
 
   // JSON Suite
@@ -125,6 +144,53 @@ const tools: ToolItem[] = [
 
   // Other Utilities Suite
   {
+    id: 'data-compare',
+    name: 'Data Compare & Multi-Diff',
+    category: 'utilities',
+    categoryLabel: 'Other Utilities',
+    badge: 'New in v2.1',
+    description: 'Compare code (Groovy for Katalon, SQL, Python, Java, JS), text paragraphs, spreadsheets (Excel/CSV), and PDF revisions side-by-side.',
+    icon: <GitCompare className="w-7 h-7 text-indigo-600" />,
+    path: '/data-compare',
+    cardBg: 'bg-white',
+    borderColor: 'border-slate-200',
+    hoverBorder: 'hover:border-indigo-400 hover:shadow-indigo-50/50',
+    accentColor: 'text-indigo-600',
+    available: true,
+    features: ['Groovy (Katalon), SQL & Code scripts', 'Excel (.xlsx) & CSV cell-level diff', 'PDF document revision comparison', 'Word-level & line-level visual highlights']
+  },
+  {
+    id: 'regex-live-tester',
+    name: 'Regex Live Tester & Builder',
+    category: 'utilities',
+    categoryLabel: 'Other Utilities',
+    badge: 'Experimental',
+    description: 'Test regular expressions in real-time with visual group highlights, search-and-replace, and an interactive click-to-match pattern synthesizer.',
+    icon: <Flame className="w-7 h-7 text-amber-500" />,
+    path: '/regex-live-tester',
+    cardBg: 'bg-white',
+    borderColor: 'border-slate-200',
+    hoverBorder: 'hover:border-amber-400 hover:shadow-amber-50/50',
+    accentColor: 'text-amber-600',
+    available: true,
+    features: ['Live match highlighting', 'Interactive pattern synthesizer', 'Group inspector table', 'Multi-language code generator']
+  },
+  {
+    id: 'base64-converter',
+    name: 'Base64 Encoder / Decoder',
+    category: 'utilities',
+    categoryLabel: 'Other Utilities',
+    description: 'Convert strings, images, and documents (PDF, Word, Excel) to Base64 and reconstruct them back into downloadable files.',
+    icon: <Binary className="w-7 h-7 text-emerald-600" />,
+    path: '/base64-converter',
+    cardBg: 'bg-white',
+    borderColor: 'border-slate-200',
+    hoverBorder: 'hover:border-emerald-400 hover:shadow-emerald-50/50',
+    accentColor: 'text-emerald-600',
+    available: true,
+    features: ['Images, PDFs, Word & Excel files', 'Magic-byte auto-detection & preview', 'Data URI, HTML img & CSS formats', 'URL-Safe & Basic Auth helper']
+  },
+  {
     id: 'document-converter',
     name: 'Document Converter',
     category: 'utilities',
@@ -153,7 +219,7 @@ const tools: ToolItem[] = [
     hoverBorder: '',
     accentColor: 'text-slate-500',
     available: false,
-    features: ['CSV to JSON Transformer', 'Base64 encoder/decoder', 'Regex live tester']
+    features: ['CSV to JSON Transformer', 'Regex live tester', 'UUID & Hash generator']
   }
 ];
 
@@ -195,7 +261,7 @@ const LandingPage: React.FC = () => {
               <div className="flex items-center gap-2">
                 <h1 className="text-lg font-bold text-slate-900 tracking-tight">ian's Toolkit</h1>
                 <span className="text-xs font-semibold px-2 py-0.5 bg-slate-100 text-slate-700 rounded-md border border-slate-200">
-                  v2.0
+                  v2.1
                 </span>
               </div>
               <p className="text-xs text-slate-500 hidden sm:block">Productivity suite for PDF, JSON & other utilities</p>
@@ -428,7 +494,7 @@ const LandingPage: React.FC = () => {
             <span>·</span>
             <span>ian's Toolkit</span>
             <span>·</span>
-            <span>v2.0</span>
+            <span>v2.1</span>
           </div>
           <div>
             Fast, secure, client-side tools — no files or data uploaded to external servers.

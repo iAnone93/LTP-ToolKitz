@@ -1,9 +1,9 @@
-# LTP-ToolKitz (ian's Toolkit v2.0)
+# LTP-ToolKitz (ian's Toolkit v2.1)
 
 > **High-Performance Productivity Suite for PDF, JSON & Other Utilities**  
 > 100% Client-Side · Privacy-First · Zero Server Uploads · Fast & Offline-Ready
 
-[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](package.json)
 [![React](https://img.shields.io/badge/React-18.2-61dafb.svg)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178c6.svg)](https://www.typescriptlang.org/)
 [![Vite](https://img.shields.io/badge/Vite-5.0-646cff.svg)](https://vitejs.dev/)
@@ -57,14 +57,24 @@
 ---
 
 ### 🛠️ Other Utilities
+- **Base64 Encoder / Decoder (`/base64-converter`)**
+  - **Text & Code Strings**: Instant bi-directional encoding and decoding between plain text, UTF-8 strings, and Base64.
+  - **Images & Documents (PDF, Word, Excel)**:
+    - **File $\to$ Base64**: Upload or drag-and-drop images (PNG, JPG, SVG, WebP, GIF) or documents (PDF, Word `.docx`, Excel `.xlsx`, text) to generate Base64 with live previews. Output as Data URI, raw Base64, HTML `<img>`, CSS `background-image`, or Markdown.
+    - **Base64 $\to$ File**: Paste raw Base64 or Data URIs; automatically reconstructs binary files using magic-byte auto-detection (%PDF, PNG, JPEG, GIF, WebP, SVG, Office ZIP). Features live image and PDF viewer previews and instant file download.
+  - **URL-Safe Base64**: Full RFC 4648 §5 compliance (`+` $\to$ `-`, `/` $\to$ `_`, optional unpadded).
+  - **UTF-8 Safe**: Native `TextEncoder`/`TextDecoder` pipeline handles complex Unicode, accents, and emojis without standard `btoa`/`atob` byte errors.
+  - **Tester Presets & Tools**: Built-in HTTP Basic Auth header generator (`username:password` $\to$ `Authorization: Basic <base64>`), JSON auto-detection and format utility, sample files, and instant file download.
+  - **Undo / Redo History**: Full <kbd>Ctrl+Z</kbd> / <kbd>Cmd+Z</kbd> history tracking and auto-sanitize repair for malformed Base64 streams.
+
 - **Document Converter (`/document-converter`)**
   - In-browser file conversion between **PDF**, **Word (`.docx`)**, **Excel (`.xlsx`)**, and text.
   - Retains structure, sheet layouts, and text formatting without relying on third-party backend conversion APIs.
 
 - **Pipeline (Coming Soon)**:
   - CSV to JSON transformer
-  - Base64 encoder / decoder
   - Regex live evaluation tester
+  - UUID & hash generator
 
 ---
 

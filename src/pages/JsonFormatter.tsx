@@ -531,7 +531,7 @@ const JsonFormatter: React.FC = () => {
             <div className="flex items-center gap-2">
               <h1 className="text-lg font-bold text-slate-900 tracking-tight">JSON Formatter & Validator</h1>
               <span className="text-xs font-semibold px-2 py-0.5 bg-slate-100 text-slate-700 rounded-md border border-slate-200">
-                v2.0
+                v2.1
               </span>
             </div>
             <p className="text-xs text-slate-500 hidden sm:block">
@@ -918,7 +918,7 @@ const JsonFormatter: React.FC = () => {
               </span>
             ) : (
               <span className="text-slate-400">
-                LTP-ToolKitz JSON Engine · v2.0
+                LTP-ToolKitz JSON Engine · v2.1
               </span>
             )}
           </div>

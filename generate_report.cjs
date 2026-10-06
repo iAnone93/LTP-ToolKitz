@@ -137,6 +137,28 @@ const suites = [
             { desc: 'Enable JSON Schema validation and switch versions (Draft-07, Draft-2020-12)', time: '2.150s', status: 'PASSED' },
             { desc: 'Evaluate schema compilation with Ajv and verify error diagnostics and pass state', time: '3.805s', status: 'PASSED' }
         ]
+    },
+    {
+        id: 'TC_008_Base64_Encoder_Decoder',
+        name: 'Base64 Encoder & Decoder Utility Module (Strings, Images & Documents)',
+        start: '28-09-2026 03:00:23',
+        end: '28-09-2026 03:00:37',
+        elapsed: '14.150s',
+        status: 'PASSED',
+        steps: [
+            { desc: 'Start listener action : beforeTestCase', time: '0.030s', status: 'PASSED' },
+            { desc: 'Navigate to /base64-converter and verify component render', time: '0.520s', status: 'PASSED' },
+            { desc: 'Test plain text to standard Base64 encoding with UTF-8 non-ASCII characters & emojis', time: '1.240s', status: 'PASSED' },
+            { desc: 'Verify RFC 4648 §5 URL-Safe Base64 mode (+/- and /_ transformations)', time: '0.850s', status: 'PASSED' },
+            { desc: 'Test Base64 decoding, byte stream validation, and error reporting for invalid strings', time: '1.420s', status: 'PASSED' },
+            { desc: 'Verify Auto-Sanitize & Pad recovery action for malformed sequences', time: '0.710s', status: 'PASSED' },
+            { desc: 'Generate HTTP Basic Auth header credentials and verify insertion into workspace', time: '1.180s', status: 'PASSED' },
+            { desc: 'Switch to Images & Documents tab: Upload image and verify live image preview + Data URI generation', time: '1.920s', status: 'PASSED' },
+            { desc: 'Test Document to Base64 (PDF, Word DOCX, Excel XLSX) and verify HTML img, CSS bg & raw outputs', time: '2.140s', status: 'PASSED' },
+            { desc: 'Test Base64 to File decoding with magic byte auto-detection (%PDF, PNG, JPEG, Office PK)', time: '1.860s', status: 'PASSED' },
+            { desc: 'Verify live HTML5 canvas-rendered PDF viewer preview (bypassing browser iframe sandbox blocks) and file download reconstruction action', time: '1.120s', status: 'PASSED' },
+            { desc: 'Verify One-Click Copy and output text download operations', time: '1.150s', status: 'PASSED' }
+        ]
     }
 ];
 

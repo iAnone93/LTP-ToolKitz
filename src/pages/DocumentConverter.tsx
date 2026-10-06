@@ -297,7 +297,7 @@ const DocumentConverter: React.FC = () => {
             <div className="flex items-center gap-2">
               <h1 className="text-lg sm:text-xl font-bold text-gray-800 tracking-tight">Document Converter</h1>
               <span className="text-xs font-semibold px-2 py-0.5 bg-orange-50 text-orange-700 rounded-md border border-orange-200 hidden sm:inline-block">
-                v2.0
+                v2.1
               </span>
             </div>
             <p className="text-xs text-gray-500 hidden sm:block">

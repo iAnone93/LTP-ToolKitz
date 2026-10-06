@@ -624,7 +624,7 @@ const JsonSchemaBuilder: React.FC = () => {
             <div className="flex items-center gap-2">
               <h1 className="text-lg sm:text-xl font-bold text-gray-800 tracking-tight">JSON Schema Builder</h1>
               <span className="text-xs font-semibold px-2 py-0.5 bg-blue-50 text-blue-700 rounded-md border border-blue-200 hidden sm:inline-block">
-                v2.0
+                v2.1
               </span>
             </div>
             <p className="text-xs text-gray-500 hidden sm:block">
