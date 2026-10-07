@@ -214,7 +214,7 @@ export async function scanPdfForSensitiveData(
   rules: RedactionRule[],
   onProgress?: (current: number, total: number) => void
 ): Promise<{ matches: DetectedMatch[]; numPages: number }> {
-  const loadingTask = pdfjsLib.getDocument({ data: pdfBuffer.slice(0) });
+  const loadingTask = pdfjsLib.getDocument({ data: pdfBuffer.slice(0), verbosity: 0 });
   const pdfJsDoc = await loadingTask.promise;
   const numPages = pdfJsDoc.numPages;
 
@@ -841,21 +841,14 @@ async function extractNativePdfImageObject(
 
       const timer = setTimeout(() => finish(null), 400);
       try {
-        if (page.objs?.has?.(imageObjId)) {
-          clearTimeout(timer);
-          finish(page.objs.get(imageObjId));
-          return;
-        }
-        if (page.commonObjs?.has?.(imageObjId)) {
-          clearTimeout(timer);
-          finish(page.commonObjs.get(imageObjId));
-          return;
-        }
         if (typeof page.objs?.get === 'function') {
           page.objs.get(imageObjId, (data: any) => {
             clearTimeout(timer);
             finish(data);
           });
+        } else if (page.commonObjs?.has?.(imageObjId)) {
+          clearTimeout(timer);
+          finish(page.commonObjs.get(imageObjId));
         } else {
           clearTimeout(timer);
           finish(null);
@@ -939,6 +932,9 @@ async function extractNativePdfImageObject(
   return null;
 }
 
+// Remember unreachable external image URLs so large multi-image PDFs never stall on dead links
+const failedExternalUrlsCache = new Set<string>();
+
 /**
  * Fetch the linked original full-resolution image via our server-side CORS-free proxy
  * (`/api/proxy-image?url=...`) or direct browser fetch when a PDF thumbnail links to an
@@ -948,8 +944,8 @@ async function tryFetchLinkedOriginalImage(
   url?: string
 ): Promise<{ dataUrl: string; width: number; height: number } | null> {
   if (!url || typeof document === 'undefined' || !/^https?:\/\//i.test(url)) return null;
-  // Skip synthetic demo placeholder URL
-  if (url.includes('d3a1545c382c8b.cloudfront.net')) return null;
+  // Skip synthetic demo placeholder URL or previously failed URLs
+  if (url.includes('d3a1545c382c8b.cloudfront.net') || failedExternalUrlsCache.has(url)) return null;
 
   const loadViaImageElement = (srcUrl: string, timeoutMs: number) =>
     new Promise<{ dataUrl: string; width: number; height: number } | null>((resolve) => {
@@ -996,11 +992,15 @@ async function tryFetchLinkedOriginalImage(
 
   // 1. Try server-side CORS-free proxy first (`/api/proxy-image?url=...`)
   const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(url)}`;
-  const viaProxy = await loadViaImageElement(proxyUrl, 4500);
+  const viaProxy = await loadViaImageElement(proxyUrl, 2500);
   if (viaProxy) return viaProxy;
 
   // 2. Fallback to direct CORS image load
-  return await loadViaImageElement(url, 2000);
+  const viaDirect = await loadViaImageElement(url, 1500);
+  if (!viaDirect) {
+    failedExternalUrlsCache.add(url);
+  }
+  return viaDirect;
 }
 
 /**
@@ -1071,9 +1071,8 @@ async function extractRawUncroppedImagesFromPdfPage(
     const pageResources = page.node.lookupMaybe(PDFName.of('Resources'), PDFDict);
     let imageStreams = collectXObjectsFromResources(pageResources);
 
-    // If the image stream was stored inside an indirect Pattern stream or unreferenced dictionary,
-    // scan all indirect objects in the PDF document for `/Subtype /Image` streams
-    if (imageStreams.length === 0) {
+    // Only scan global indirect objects when the entire PDF has <= 4 pages (prevents decoding all 225 images on every page of a huge PDF!)
+    if (imageStreams.length === 0 && pages.length <= 4) {
       for (const [, obj] of pdfLibDoc.context.enumerateIndirectObjects()) {
         const rawObj = obj as any;
         if (rawObj?.dict instanceof PDFDict) {
@@ -1907,20 +1906,176 @@ export async function autoScanImagesWithOcr(
   rules: RedactionRule[],
   redactionOptions: RedactionStyleOptions,
   onProgress?: (statusText: string) => void,
-  onPartialUpdate?: (matchId: string, partial: Partial<DetectedMatch>) => void
+  onPartialUpdate?: (matchId: string, partial: Partial<DetectedMatch>) => void,
+  shouldCancel?: () => boolean
 ): Promise<Record<string, Partial<DetectedMatch>>> {
   if (typeof document === 'undefined' || imageMatches.length === 0) return {};
 
   const updates: Record<string, Partial<DetectedMatch>> = {};
 
   try {
-    // Kick off worker warm-up in parallel while we extract native full-resolution images from the PDF
+    // Kick off worker warm-up in parallel while loading the PDF document
     const workerPromise = getOrCreateOcrWorker();
 
     const [pdfDoc, pdfLibDoc] = await Promise.all([
-      pdfjsLib.getDocument({ data: pdfBuffer.slice(0) }).promise,
+      pdfjsLib.getDocument({ data: pdfBuffer.slice(0), verbosity: 0 }).promise,
       PDFDocument.load(pdfBuffer.slice(0)).catch(() => null)
     ]);
+
+    const worker = await workerPromise;
+
+    // Helper to extract normalized line items from a Tesseract recognize() response,
+    // automatically splitting lines whenever there is a large horizontal space gap between words
+    // (e.g., two-column "Label ............ Value" rows or "Header ........ Icon")!
+    const extractLinesFromOcrData = (ocrData: any, imageWidth: number): RawOcrLineItem[] => {
+      const out: RawOcrLineItem[] = [];
+      const extractedLines: any[] = [];
+      const extractedWords: any[] = [];
+
+      if (Array.isArray(ocrData?.blocks)) {
+        for (const block of ocrData.blocks) {
+          for (const para of block?.paragraphs || []) {
+            for (const line of para?.lines || []) {
+              extractedLines.push(line);
+              for (const word of line?.words || []) {
+                extractedWords.push(word);
+              }
+            }
+          }
+        }
+      }
+      if (extractedLines.length === 0 && Array.isArray(ocrData?.lines)) {
+        extractedLines.push(...ocrData.lines);
+      }
+      if (extractedWords.length === 0 && Array.isArray(ocrData?.words)) {
+        extractedWords.push(...ocrData.words);
+      }
+
+      const cleanTrailingInputArtifacts = (str: string) =>
+        str
+          .replace(/\s+[vV∨⌄▾▿<>|[\]()©®@]{1,2}\s*$/g, '') // Strip dropdown chevron / calendar / icon OCR artifacts at right edge
+          .trim();
+
+      if (extractedLines.length > 0) {
+        for (const line of extractedLines) {
+          const rawWords = Array.isArray(line.words)
+            ? line.words
+                .filter((w: any) => w?.text && w?.bbox)
+                .map((w: any) => ({
+                  text: cleanTrailingInputArtifacts(String(w.text)),
+                  bbox: {
+                    x0: Number(w.bbox.x0),
+                    y0: Number(w.bbox.y0),
+                    x1: Number(w.bbox.x1),
+                    y1: Number(w.bbox.y1)
+                  }
+                }))
+                .filter((w: any) => w.text.length > 0 && !(w.text.length === 1 && !/[a-zA-Z0-9]/.test(w.text)))
+                .sort((a: any, b: any) => a.bbox.x0 - b.bbox.x0)
+            : [];
+
+          if (rawWords.length >= 2) {
+            const lineH = Math.max(
+              10,
+              ...rawWords.map((w: any) => Math.max(8, w.bbox.y1 - w.bbox.y0))
+            );
+            const splitGapThreshold = Math.max(20, lineH * 1.65, imageWidth * 0.055);
+
+            const segments: (typeof rawWords)[] = [];
+            let currentSeg: typeof rawWords = [rawWords[0]];
+
+            for (let wIdx = 1; wIdx < rawWords.length; wIdx++) {
+              const prevW = rawWords[wIdx - 1];
+              const currW = rawWords[wIdx];
+              const gapPx = currW.bbox.x0 - prevW.bbox.x1;
+
+              if (gapPx >= splitGapThreshold) {
+                segments.push(currentSeg);
+                currentSeg = [currW];
+              } else {
+                currentSeg.push(currW);
+              }
+            }
+            segments.push(currentSeg);
+
+            const emittedSegments: RawOcrLineItem[] = [];
+            for (const seg of segments) {
+              const segText = cleanTrailingInputArtifacts(seg.map((w: any) => w.text).join(' '));
+              if (!segText || (segText.length === 1 && !/\d/.test(segText))) continue;
+
+              const segBBox = {
+                x0: Math.min(...seg.map((w: any) => w.bbox.x0)),
+                y0: Math.min(...seg.map((w: any) => w.bbox.y0)),
+                x1: Math.max(...seg.map((w: any) => w.bbox.x1)),
+                y1: Math.max(...seg.map((w: any) => w.bbox.y1))
+              };
+
+              emittedSegments.push({
+                text: segText,
+                bbox: segBBox,
+                words: seg
+              });
+            }
+
+            if (emittedSegments.length >= 2) {
+              const leftSeg = emittedSegments[0];
+              const rightSeg = emittedSegments[emittedSegments.length - 1];
+              if (leftSeg.bbox.x0 < imageWidth * 0.45 && rightSeg.bbox.x0 > leftSeg.bbox.x1) {
+                leftSeg.fieldType = 'label';
+                const cleanLeftLabel = leftSeg.text
+                  .replace(/\(\s*\*\s*\)/g, '')
+                  .replace(/:\s*$/, '')
+                  .trim();
+                for (let sIdx = 1; sIdx < emittedSegments.length; sIdx++) {
+                  emittedSegments[sIdx].fieldType = 'input_value';
+                  emittedSegments[sIdx].pairedLabel = cleanLeftLabel;
+                }
+              }
+            }
+
+            out.push(...emittedSegments);
+            continue;
+          }
+
+          const lineText = cleanTrailingInputArtifacts(String(line.text || ''));
+          if (!lineText || lineText.length < 1 || !line.bbox) continue;
+          if (lineText.length === 1 && !/\d/.test(lineText)) continue;
+
+          const tightBBox =
+            rawWords.length === 1
+              ? rawWords[0].bbox
+              : {
+                  x0: Number(line.bbox.x0),
+                  y0: Number(line.bbox.y0),
+                  x1: Number(line.bbox.x1),
+                  y1: Number(line.bbox.y1)
+                };
+
+          out.push({
+            text: lineText,
+            bbox: tightBBox,
+            words: rawWords
+          });
+        }
+      } else if (extractedWords.length > 0) {
+        for (const w of extractedWords) {
+          const wText = cleanTrailingInputArtifacts(String(w.text || ''));
+          if (!wText || (wText.length === 1 && !/\d/.test(wText)) || !w.bbox) continue;
+          const wb = {
+            x0: Number(w.bbox.x0),
+            y0: Number(w.bbox.y0),
+            x1: Number(w.bbox.x1),
+            y1: Number(w.bbox.y1)
+          };
+          out.push({
+            text: wText,
+            bbox: wb,
+            words: [{ text: wText, bbox: wb }]
+          });
+        }
+      }
+      return out;
+    };
 
     // Group image matches by pageIndex
     const byPage = new Map<number, DetectedMatch[]>();
@@ -1930,22 +2085,30 @@ export async function autoScanImagesWithOcr(
       byPage.set(m.pageIndex, list);
     }
 
-    // PHASE 1: Extract the full native uncropped image resolution for each embedded image
-    const extractedQueue: {
-      imgMatch: DetectedMatch;
-      baseDataUrl: string;
-      imgW: number;
-      imgH: number;
-    }[] = [];
+    const totalImages = imageMatches.length;
+    let processedCount = 0;
 
+    // Stream extraction + OCR immediately image-by-image so the UI updates live ("1 of N...")
+    // and never blocks in an upfront 225-image extraction queue!
     for (const [pageIdx, pageImgMatches] of byPage.entries()) {
+      if (shouldCancel?.()) break;
+
       const page = await pdfDoc.getPage(pageIdx + 1);
       const rawPageXObjects = pdfLibDoc
         ? await extractRawUncroppedImagesFromPdfPage(pdfLibDoc, pageIdx)
         : [];
 
       for (let mIdx = 0; mIdx < pageImgMatches.length; mIdx++) {
+        if (shouldCancel?.()) break;
+
         const imgMatch = pageImgMatches[mIdx];
+        processedCount++;
+        if (onProgress) {
+          onProgress(
+            `OCR scanning image ${processedCount} of ${totalImages} (Page ${pageIdx + 1})...`
+          );
+        }
+
         let baseDataUrl = '';
         let imgW = 0;
         let imgH = 0;
@@ -1963,7 +2126,8 @@ export async function autoScanImagesWithOcr(
 
         // 1. Second priority: Raw uncropped PDF XObject stream from pdf-lib (bypasses PDF clipping paths!)
         if (!baseDataUrl) {
-          const rawXObj = rawPageXObjects[mIdx] || (rawPageXObjects.length === 1 ? rawPageXObjects[0] : null);
+          const rawXObj =
+            rawPageXObjects[mIdx] || (rawPageXObjects.length === 1 ? rawPageXObjects[0] : null);
           if (rawXObj) {
             baseDataUrl = rawXObj.dataUrl;
             imgW = rawXObj.width;
@@ -2036,260 +2200,92 @@ export async function autoScanImagesWithOcr(
           onPartialUpdate(imgMatch.id, initialPartial);
         }
 
-        extractedQueue.push({ imgMatch, baseDataUrl, imgW, imgH });
-      }
-    }
+        if (shouldCancel?.()) break;
 
-    // PHASE 2: Run Dual-Pass High-Sensitivity Tesseract OCR (Original + Border-Suppressed Form Input Pass)
-    // and classify each detected line into `input_value`, `label`, or `header_or_note`!
-    const worker = await workerPromise;
-    let processedCount = 0;
+        let rawOcrLines: RawOcrLineItem[] = [];
+        let subBoxes: InImageSubBox[] = [];
+        try {
+          const { borderCleanedDataUrl, pixelData } = await prepareImageForHighSensitivityOcr(
+            baseDataUrl
+          );
 
-    // Helper to extract normalized line items from a Tesseract recognize() response,
-    // automatically splitting lines whenever there is a large horizontal space gap between words
-    // (e.g., two-column "Label ............ Value" rows or "Header ........ Icon")!
-    const extractLinesFromOcrData = (ocrData: any, imageWidth: number): RawOcrLineItem[] => {
-      const out: RawOcrLineItem[] = [];
-      const extractedLines: any[] = [];
-      const extractedWords: any[] = [];
+          // Pass 1: Standard Page Segmentation (PSM 6 - Uniform Block) on original image
+          await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
+          const pass1Result = await worker.recognize(
+            baseDataUrl,
+            {},
+            { text: true, blocks: true }
+          );
+          const pass1Lines = extractLinesFromOcrData(pass1Result?.data, imgW);
 
-      if (Array.isArray(ocrData?.blocks)) {
-        for (const block of ocrData.blocks) {
-          for (const para of block?.paragraphs || []) {
-            for (const line of para?.lines || []) {
-              extractedLines.push(line);
-              for (const word of line?.words || []) {
-                extractedWords.push(word);
-              }
-            }
-          }
-        }
-      }
-      if (extractedLines.length === 0 && Array.isArray(ocrData?.lines)) {
-        extractedLines.push(...ocrData.lines);
-      }
-      if (extractedWords.length === 0 && Array.isArray(ocrData?.words)) {
-        extractedWords.push(...ocrData.words);
-      }
-
-      const cleanTrailingInputArtifacts = (str: string) =>
-        str
-          .replace(/\s+[vV∨⌄▾▿<>|[\]()©®@]{1,2}\s*$/g, '') // Strip dropdown chevron / calendar / icon OCR artifacts at right edge
-          .trim();
-
-      if (extractedLines.length > 0) {
-        for (const line of extractedLines) {
-          const rawWords = Array.isArray(line.words)
-            ? line.words
-                .filter((w: any) => w?.text && w?.bbox)
-                .map((w: any) => ({
-                  text: cleanTrailingInputArtifacts(String(w.text)),
-                  bbox: {
-                    x0: Number(w.bbox.x0),
-                    y0: Number(w.bbox.y0),
-                    x1: Number(w.bbox.x1),
-                    y1: Number(w.bbox.y1)
-                  }
-                }))
-                .filter((w: any) => w.text.length > 0 && !(w.text.length === 1 && !/[a-zA-Z0-9]/.test(w.text)))
-                .sort((a: any, b: any) => a.bbox.x0 - b.bbox.x0)
-            : [];
-
-          if (rawWords.length >= 2) {
-            // Segment `rawWords` into horizontal clusters whenever the gap between consecutive words
-            // exceeds a multi-space threshold (`max(20px, lineH * 1.65, imageWidth * 0.055)`).
-            const lineH = Math.max(
-              10,
-              ...rawWords.map((w: any) => Math.max(8, w.bbox.y1 - w.bbox.y0))
+          // For large batch PDFs (> 12 images), only run Pass 2 if Pass 1 found fewer than 8 lines,
+          // cutting OCR time in half while keeping full dual-pass sensitivity when needed!
+          let pass2Lines: RawOcrLineItem[] = [];
+          if (totalImages <= 12 || pass1Lines.length < 8) {
+            await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
+            const pass2Result = await worker.recognize(
+              borderCleanedDataUrl,
+              {},
+              { text: true, blocks: true }
             );
-            const splitGapThreshold = Math.max(20, lineH * 1.65, imageWidth * 0.055);
-
-            const segments: (typeof rawWords)[] = [];
-            let currentSeg: typeof rawWords = [rawWords[0]];
-
-            for (let wIdx = 1; wIdx < rawWords.length; wIdx++) {
-              const prevW = rawWords[wIdx - 1];
-              const currW = rawWords[wIdx];
-              const gapPx = currW.bbox.x0 - prevW.bbox.x1;
-
-              if (gapPx >= splitGapThreshold) {
-                segments.push(currentSeg);
-                currentSeg = [currW];
-              } else {
-                currentSeg.push(currW);
-              }
-            }
-            segments.push(currentSeg);
-
-            // Emit each separated word cluster as its own distinct OCR item with its own tight bounding box!
-            const emittedSegments: RawOcrLineItem[] = [];
-            for (const seg of segments) {
-              const segText = cleanTrailingInputArtifacts(seg.map((w: any) => w.text).join(' '));
-              if (!segText || (segText.length === 1 && !/\d/.test(segText))) continue;
-
-              const segBBox = {
-                x0: Math.min(...seg.map((w: any) => w.bbox.x0)),
-                y0: Math.min(...seg.map((w: any) => w.bbox.y0)),
-                x1: Math.max(...seg.map((w: any) => w.bbox.x1)),
-                y1: Math.max(...seg.map((w: any) => w.bbox.y1))
-              };
-
-              emittedSegments.push({
-                text: segText,
-                bbox: segBBox,
-                words: seg
-              });
-            }
-
-            // If this line split into exactly 2 (or more) horizontal columns on the same row
-            // (e.g., Left = "Tempat Lahir", Right = "BANDUNG"), tag the left segment as `label`
-            // and pre-pair the right segment(s) with that left label!
-            if (emittedSegments.length >= 2) {
-              const leftSeg = emittedSegments[0];
-              const rightSeg = emittedSegments[emittedSegments.length - 1];
-              // Verify left segment starts in the left half of the card and right segment is to its right
-              if (leftSeg.bbox.x0 < imageWidth * 0.45 && rightSeg.bbox.x0 > leftSeg.bbox.x1) {
-                leftSeg.fieldType = 'label';
-                const cleanLeftLabel = leftSeg.text
-                  .replace(/\(\s*\*\s*\)/g, '')
-                  .replace(/:\s*$/, '')
-                  .trim();
-                for (let sIdx = 1; sIdx < emittedSegments.length; sIdx++) {
-                  emittedSegments[sIdx].fieldType = 'input_value';
-                  emittedSegments[sIdx].pairedLabel = cleanLeftLabel;
-                }
-              }
-            }
-
-            out.push(...emittedSegments);
-            continue;
+            pass2Lines = extractLinesFromOcrData(pass2Result?.data, imgW);
+            await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
           }
 
-          const lineText = cleanTrailingInputArtifacts(String(line.text || ''));
-          if (!lineText || lineText.length < 1 || !line.bbox) continue;
-          if (lineText.length === 1 && !/\d/.test(lineText)) continue;
+          const mergedLines: RawOcrLineItem[] = [...pass1Lines];
+          for (const cand of pass2Lines) {
+            const candCy = (cand.bbox.y0 + cand.bbox.y1) / 2;
+            const candH = Math.max(8, cand.bbox.y1 - cand.bbox.y0);
 
-          const tightBBox =
-            rawWords.length === 1
-              ? rawWords[0].bbox
-              : {
-                  x0: Number(line.bbox.x0),
-                  y0: Number(line.bbox.y0),
-                  x1: Number(line.bbox.x1),
-                  y1: Number(line.bbox.y1)
-                };
+            const alreadyExists = mergedLines.some((ex) => {
+              const exCy = (ex.bbox.y0 + ex.bbox.y1) / 2;
+              const sameRow =
+                Math.abs(candCy - exCy) < Math.max(candH, ex.bbox.y1 - ex.bbox.y0) * 0.65;
+              if (!sameRow) return false;
 
-          out.push({
-            text: lineText,
-            bbox: tightBBox,
-            words: rawWords
-          });
+              const overlapX = Math.max(
+                0,
+                Math.min(cand.bbox.x1, ex.bbox.x1) - Math.max(cand.bbox.x0, ex.bbox.x0)
+              );
+              const minW = Math.max(
+                1,
+                Math.min(cand.bbox.x1 - cand.bbox.x0, ex.bbox.x1 - ex.bbox.x0)
+              );
+              return overlapX / minW > 0.45;
+            });
+
+            if (!alreadyExists) {
+              mergedLines.push(cand);
+            }
+          }
+
+          rawOcrLines = classifyAndPairOcrLines(mergedLines, pixelData, imgW, imgH);
+          subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imgW, imgH);
+        } catch (ocrErr) {
+          console.warn('OCR scan warning on image', ocrErr);
         }
-      } else if (extractedWords.length > 0) {
-        for (const w of extractedWords) {
-          const wText = cleanTrailingInputArtifacts(String(w.text || ''));
-          if (!wText || (wText.length === 1 && !/\d/.test(wText)) || !w.bbox) continue;
-          const wb = {
-            x0: Number(w.bbox.x0),
-            y0: Number(w.bbox.y0),
-            x1: Number(w.bbox.x1),
-            y1: Number(w.bbox.y1)
-          };
-          out.push({
-            text: wText,
-            bbox: wb,
-            words: [{ text: wText, bbox: wb }]
-          });
-        }
-      }
-      return out;
-    };
 
-    for (const { imgMatch, baseDataUrl, imgW, imgH } of extractedQueue) {
-      processedCount++;
-      if (onProgress) {
-        onProgress(`High-sensitivity OCR scanning image ${processedCount} of ${extractedQueue.length}...`);
-      }
-
-      let rawOcrLines: RawOcrLineItem[] = [];
-      let subBoxes: InImageSubBox[] = [];
-      try {
-        // Prepare border-erased image copy + raw pixel buffer for input-box border inspection
-        const { borderCleanedDataUrl, pixelData } = await prepareImageForHighSensitivityOcr(baseDataUrl);
-
-        // Pass 1: Standard Page Segmentation (PSM 6 - Uniform Block) on original image (captures multi-word sentences, headers & labels)
-        await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
-        const pass1Result = await worker.recognize(
+        const redactedDataUrl = await renderSanitizedImageWithSubBoxes(
           baseDataUrl,
-          {},
-          { text: true, blocks: true }
+          subBoxes,
+          redactionOptions
         );
-        const pass1Lines = extractLinesFromOcrData(pass1Result?.data, imgW);
 
-        // Pass 2: Sparse Text (PSM 11) on Border-Cleaned image (captures isolated words inside bordered input boxes & dropdowns like LAGOA, 14270, Buruh, Diploma 3)
-        await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
-        const pass2Result = await worker.recognize(
-          borderCleanedDataUrl,
-          {},
-          { text: true, blocks: true }
-        );
-        const pass2Lines = extractLinesFromOcrData(pass2Result?.data, imgW);
+        const finalUpdate: Partial<DetectedMatch> = {
+          originalImageDataUrl: baseDataUrl,
+          redactedImageDataUrl: redactedDataUrl,
+          imagePixelWidth: imgW,
+          imagePixelHeight: imgH,
+          rawOcrLines,
+          subBoxes,
+          imageMode: 'partial',
+          createLocalFullSizePage: true
+        };
 
-        // Reset worker default PSM to 6
-        await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
-
-        // Merge Pass 1 + Pass 2 lines, deduplicating by spatial overlap so newly discovered input boxes are added cleanly
-        const mergedLines: RawOcrLineItem[] = [...pass1Lines];
-        for (const cand of pass2Lines) {
-          const candCy = (cand.bbox.y0 + cand.bbox.y1) / 2;
-          const candH = Math.max(8, cand.bbox.y1 - cand.bbox.y0);
-
-          const alreadyExists = mergedLines.some((ex) => {
-            const exCy = (ex.bbox.y0 + ex.bbox.y1) / 2;
-            const sameRow = Math.abs(candCy - exCy) < Math.max(candH, ex.bbox.y1 - ex.bbox.y0) * 0.65;
-            if (!sameRow) return false;
-
-            const overlapX = Math.max(
-              0,
-              Math.min(cand.bbox.x1, ex.bbox.x1) - Math.max(cand.bbox.x0, ex.bbox.x0)
-            );
-            const minW = Math.max(1, Math.min(cand.bbox.x1 - cand.bbox.x0, ex.bbox.x1 - ex.bbox.x0));
-            return overlapX / minW > 0.45;
-          });
-
-          if (!alreadyExists) {
-            mergedLines.push(cand);
-          }
+        updates[imgMatch.id] = finalUpdate;
+        if (onPartialUpdate) {
+          onPartialUpdate(imgMatch.id, finalUpdate);
         }
-
-        // Classify each line as `input_value`, `label`, or `header_or_note` and pair each `input_value` with the label above it!
-        rawOcrLines = classifyAndPairOcrLines(mergedLines, pixelData, imgW, imgH);
-
-        subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imgW, imgH);
-      } catch (ocrErr) {
-        console.warn('OCR scan warning on image', ocrErr);
-      }
-
-      const redactedDataUrl = await renderSanitizedImageWithSubBoxes(
-        baseDataUrl,
-        subBoxes,
-        redactionOptions
-      );
-
-      const finalUpdate: Partial<DetectedMatch> = {
-        originalImageDataUrl: baseDataUrl,
-        redactedImageDataUrl: redactedDataUrl,
-        imagePixelWidth: imgW,
-        imagePixelHeight: imgH,
-        rawOcrLines,
-        subBoxes,
-        imageMode: 'partial',
-        createLocalFullSizePage: true
-      };
-
-      updates[imgMatch.id] = finalUpdate;
-      if (onPartialUpdate) {
-        onPartialUpdate(imgMatch.id, finalUpdate);
       }
     }
   } catch (err) {
