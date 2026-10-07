@@ -180,6 +180,7 @@ const PdfRedactor: React.FC = () => {
   // Canvas Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const activeRenderTaskRef = useRef<any>(null);
   const [renderedViewport, setRenderedViewport] = useState<{ width: number; height: number } | null>(null);
 
   const getImageCacheKey = (m: DetectedMatch) =>
@@ -392,31 +393,59 @@ const PdfRedactor: React.FC = () => {
     if (!pdfBuffer || !canvasRef.current) return;
 
     let isCancelled = false;
+    let currentRenderTask: any = null;
+
+    // Cancel any previous in-flight PDF.js render task immediately
+    if (activeRenderTaskRef.current) {
+      try {
+        activeRenderTaskRef.current.cancel();
+      } catch {
+        // ignore cancel error
+      }
+      activeRenderTaskRef.current = null;
+    }
+
     const renderPage = async () => {
       try {
         const loadingTask = pdfjsLib.getDocument({ data: pdfBuffer.slice(0) });
         const pdfDoc = await loadingTask.promise;
+        if (isCancelled) return;
+
         const page = await pdfDoc.getPage(currentPage + 1);
+        if (isCancelled) return;
 
         const viewport = page.getViewport({ scale: zoomScale });
+
+        // Render onto a dedicated offscreen canvas first so PDF.js never collides on the same HTMLCanvasElement
+        // even during rapid page switches, zoom changes, or React StrictMode double-invocations!
+        const offscreenCanvas = document.createElement('canvas');
+        offscreenCanvas.width = viewport.width;
+        offscreenCanvas.height = viewport.height;
+        const offCtx = offscreenCanvas.getContext('2d');
+        if (!offCtx) return;
+
+        currentRenderTask = page.render({
+          canvasContext: offCtx,
+          viewport
+        });
+        activeRenderTaskRef.current = currentRenderTask;
+
+        await currentRenderTask.promise;
+        if (isCancelled) return;
+
         const canvas = canvasRef.current;
         if (!canvas) return;
-
         canvas.width = viewport.width;
         canvas.height = viewport.height;
-
         const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-
-        const renderContext = {
-          canvasContext: ctx,
-          viewport
-        };
-
-        await page.render(renderContext).promise;
+        if (ctx) {
+          ctx.drawImage(offscreenCanvas, 0, 0);
+        }
 
         // Also extract text items for the selectable PDF text layer (Quick Custom Regex selection)
         const textContent = await page.getTextContent();
+        if (isCancelled) return;
+
         const extractedItems: ExtractedTextItem[] = [];
         for (const item of textContent.items as any[]) {
           const text = item.str;
@@ -442,7 +471,10 @@ const PdfRedactor: React.FC = () => {
           setPageTextItems(extractedItems);
           setQuickRegexPopup(null);
         }
-      } catch (err) {
+      } catch (err: any) {
+        if (err?.name === 'RenderingCancelledException' || isCancelled) {
+          return;
+        }
         console.error('Page rendering error', err);
       }
     };
@@ -451,6 +483,13 @@ const PdfRedactor: React.FC = () => {
 
     return () => {
       isCancelled = true;
+      if (currentRenderTask) {
+        try {
+          currentRenderTask.cancel();
+        } catch {
+          // ignore
+        }
+      }
     };
   }, [pdfBuffer, currentPage, zoomScale]);
 
@@ -2222,19 +2261,19 @@ const PdfRedactor: React.FC = () => {
                               width: `${box.wRatio * 100}%`,
                               height: `${box.hRatio * 100}%`
                             }}
-                            className={`group transition-all flex items-center justify-center cursor-pointer rounded-xs border ${
+                            className={`group transition-all flex items-center justify-center cursor-pointer rounded-xs border overflow-hidden ${
                               box.selected
                                 ? redactionOptions.mode === 'blackout'
-                                  ? 'bg-neutral-950 border-rose-500 text-white shadow-md'
+                                  ? 'bg-neutral-950 border-rose-500 text-white shadow-2xs'
                                   : redactionOptions.mode === 'whiteout'
-                                  ? 'bg-white border-slate-400 text-slate-700 shadow-md'
+                                  ? 'bg-white border-slate-400 text-slate-700 shadow-2xs'
                                   : redactionOptions.boxColor === 'red_tint'
-                                  ? 'bg-rose-100 border-rose-600 text-rose-900 shadow-md'
+                                  ? 'bg-rose-100 border-rose-600 text-rose-900 shadow-2xs'
                                   : redactionOptions.boxColor === 'white'
-                                  ? 'bg-white border-slate-400 text-slate-800 shadow-md'
+                                  ? 'bg-white border-slate-400 text-slate-800 shadow-2xs'
                                   : redactionOptions.boxColor === 'black'
-                                  ? 'bg-black border-slate-700 text-white shadow-md'
-                                  : 'bg-slate-900 border-indigo-400 text-white shadow-md'
+                                  ? 'bg-black border-slate-700 text-white shadow-2xs'
+                                  : 'bg-slate-900 border-indigo-400 text-white shadow-2xs'
                                 : box.fieldType === 'input_value'
                                 ? 'bg-indigo-500/15 border-dashed border-indigo-400 hover:bg-rose-500/25 hover:border-rose-400'
                                 : 'bg-emerald-500/12 border-dashed border-emerald-400/80 hover:bg-rose-500/25 hover:border-rose-400'
@@ -2244,7 +2283,7 @@ const PdfRedactor: React.FC = () => {
                             } — Click to ${box.selected ? 'keep readable' : 'redact'}`}
                           >
                             {box.selected && (
-                              <span className="text-[10px] sm:text-[11px] font-mono font-bold px-1.5 truncate pointer-events-none tracking-wide">
+                              <span className="text-[8px] sm:text-[9px] leading-none font-mono font-bold px-0.5 truncate pointer-events-none tracking-tight">
                                 {redactionOptions.mode === 'replacement_text'
                                   ? redactionOptions.replacementText
                                   : redactionOptions.mode === 'whiteout'

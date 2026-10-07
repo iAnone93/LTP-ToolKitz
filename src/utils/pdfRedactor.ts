@@ -765,25 +765,33 @@ export async function renderSanitizedImageWithSubBoxes(
           ctx.fillStyle = bgHex;
           ctx.fillRect(bx, by, bw, bh);
           ctx.strokeStyle = borderHex;
-          ctx.lineWidth = Math.max(1, Math.round(canvas.width / 400));
+          ctx.lineWidth = 1;
           ctx.strokeRect(bx, by, bw, bh);
 
-          const fontSize = Math.max(9, Math.min(Math.floor(bh * 0.65), 28));
+          const availW = Math.max(4, bw - 4);
+          let fontSize = Math.max(6, Math.min(Math.floor(bh * 0.72), 20));
           ctx.font = `bold ${fontSize}px sans-serif`;
+
+          let display = rawLabel;
+          const fullTextW = ctx.measureText(display).width;
+          if (fullTextW > availW) {
+            const scaledFont = Math.max(6, Math.floor(fontSize * (availW / fullTextW)));
+            fontSize = scaledFont;
+            ctx.font = `bold ${fontSize}px sans-serif`;
+          }
+
+          if (ctx.measureText(display).width > availW && display.length > 3) {
+            let t = display;
+            while (t.length > 1 && ctx.measureText(t + '..').width > availW) {
+              t = t.slice(0, -1);
+            }
+            display = t + '..';
+          }
+
           ctx.fillStyle = textHex;
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
-
-          let display = rawLabel;
-          const availW = Math.max(6, bw - 6);
-          if (ctx.measureText(display).width > availW && display.length > 4) {
-            let t = display;
-            while (t.length > 1 && ctx.measureText(t + '...').width > availW) {
-              t = t.slice(0, -1);
-            }
-            display = t + '...';
-          }
-          ctx.fillText(display, bx + bw / 2, by + bh / 2);
+          ctx.fillText(display, bx + bw / 2, by + bh / 2 + 0.5);
         }
       }
 
@@ -1250,7 +1258,8 @@ async function extractRawUncroppedImagesFromPdfPage(
 }
 
 /**
- * Helper to generously pad an OCR bounding box so ascenders, descenders, and full glyph heights are 100% covered
+ * Helper to compute a tight, exact-fit bounding box around an OCR text span
+ * so adjacent rows never overlap and replacement/blackout bars match the exact text height and width!
  */
 function computeFullCoverageBox(
   rawBbox: { x0: number; y0: number; x1: number; y1: number },
@@ -1264,37 +1273,41 @@ function computeFullCoverageBox(
   let maxY = Number(rawBbox.y1);
 
   if (Array.isArray(wordsInSpan) && wordsInSpan.length > 0) {
+    let validWords = 0;
+    let wMinX = Infinity;
+    let wMinY = Infinity;
+    let wMaxX = -Infinity;
+    let wMaxY = -Infinity;
+
     for (const w of wordsInSpan) {
       if (w?.bbox) {
-        minX = Math.min(minX, Number(w.bbox.x0));
-        minY = Math.min(minY, Number(w.bbox.y0));
-        maxX = Math.max(maxX, Number(w.bbox.x1));
-        maxY = Math.max(maxY, Number(w.bbox.y1));
+        validWords++;
+        wMinX = Math.min(wMinX, Number(w.bbox.x0));
+        wMinY = Math.min(wMinY, Number(w.bbox.y0));
+        wMaxX = Math.max(wMaxX, Number(w.bbox.x1));
+        wMaxY = Math.max(wMaxY, Number(w.bbox.y1));
       }
+    }
+
+    if (validWords > 0 && wMaxX > wMinX && wMaxY > wMinY) {
+      minX = wMinX;
+      minY = wMinY;
+      maxX = wMaxX;
+      maxY = wMaxY;
     }
   }
 
   const rawH = Math.max(8, maxY - minY);
 
-  // Expand vertically by 38% above and 38% below (plus a minimum pixel floor based on image height)
-  // so Tesseract's tight baseline bbox never leaves the top or bottom of letters exposed!
-  const padX = Math.max(6, Math.round(rawH * 0.3), Math.round(imageWidth * 0.012));
-  const padTop = Math.max(6, Math.round(rawH * 0.38), Math.round(imageHeight * 0.012));
-  const padBottom = Math.max(6, Math.round(rawH * 0.38), Math.round(imageHeight * 0.012));
+  // Tight 1-2px padding (~8% of glyph height) so the highlight and censor bar match the exact text bounds
+  // without colliding or overlapping with the row above or below!
+  const padX = Math.max(2, Math.min(4, Math.round(rawH * 0.12)));
+  const padY = Math.max(1, Math.min(3, Math.round(rawH * 0.08)));
 
-  let x0 = Math.max(0, minX - padX);
-  let y0 = Math.max(0, minY - padTop);
-  let x1 = Math.min(imageWidth, maxX + padX);
-  let y1 = Math.min(imageHeight, maxY + padBottom);
-
-  // Enforce a healthy minimum censor bar thickness relative to line width/image height
-  const minCensorHeight = Math.max(22, Math.round(rawH * 1.55), Math.round(imageHeight * 0.042));
-  const currentH = y1 - y0;
-  if (currentH < minCensorHeight) {
-    const extra = (minCensorHeight - currentH) / 2;
-    y0 = Math.max(0, y0 - extra);
-    y1 = Math.min(imageHeight, y1 + extra);
-  }
+  const x0 = Math.max(0, minX - padX);
+  const y0 = Math.max(0, minY - padY);
+  const x1 = Math.min(imageWidth, maxX + padX);
+  const y1 = Math.min(imageHeight, maxY + padY);
 
   return { x0, y0, x1, y1 };
 }
@@ -1554,7 +1567,7 @@ function classifyAndPairOcrLines(
   const isRequiredMarkerLabel = /\(\s*\*\s*\)|:\s*$/;
   const isHelperNoteRegex = /^\*|\b(wajib|maximum|maksimum|sesuai dengan|apakah)\b/i;
   const isKnownFormLabelRegex =
-    /^(sektor\s+ekonomi|sub\s+sektor|jenis\s+usaha|status\s+perkawinan|alamat\s+identitas|kelurahan|kecamatan|kode\s+pos|kode\s+pekerjaan|kode\s+status|pendidikan|gelar|nama\s+nasabah|tanggal\s+lahir|nomor|nik|npwp|no\.\s*hp|telepon|email)\b/i;
+    /^(id\s+pipeline|sektor\s+ekonomi|sub\s+sektor|jenis\s+usaha|status\s+perkawinan|status\s+tempat|alamat\s+identitas|alamat|kelurahan|kecamatan|kode\s+pos|kode\s+pekerjaan|kode\s+status|pendidikan|gelar|nama\s+nasabah|nama\s+aom|nip\s+aom|tempat\s+lahir|tanggal\s+lahir|jenis\s+kelamin|lama\s+usaha|rencana\s+plafon|no\.?\s*telepon|no\.?\s*hp|telepon|email|keterangan|nomor|nik|npwp)\b/i;
   const isHeaderOrBannerRegex =
     /\b(form\s+data|form\s+uji|uji\s+kelayakan|detail\s+informasi|daftar\s+prospek|save\s+draft|back|home|inisiasi|baru\s*-\s*baru)\b/i;
   const isStatusBarRegex = /\b\d{1,2}:\d{2}\b.*%|\b(4g|5g|lte|wifi)\b/i;
@@ -1574,18 +1587,66 @@ function classifyAndPairOcrLines(
       item.fieldType = 'label';
     } else if (isWhiteInputBox) {
       item.fieldType = 'input_value';
+    } else if (item.pairedLabel) {
+      // Already paired horizontally via wide-gap column split (e.g., left label + right value on the same row)
+      item.fieldType = 'input_value';
     } else {
-      // Default to header_or_note unless paired directly underneath a Form Label in Pass 2
+      // Default to header_or_note unless paired horizontally or vertically with a Form Label in Pass 2
       item.fieldType = 'header_or_note';
     }
   }
 
-  // Second pass: Pair each `label` with the value line directly below it (and promote that line to `input_value` if it isn't a label/header)
+  // Second pass:
+  // 2A. Horizontal Same-Row Pairing (Key-Value summary cards where left column = Label and right column = Value)
+  // 2B. Vertical Stacked Pairing (Form inputs where top line = Label and box below = Input Value)
   for (let i = 0; i < sorted.length; i++) {
     const curr = sorted[i];
     if (curr.fieldType === 'label') {
       const cleanLabelName = curr.text.replace(/\(\s*\*\s*\)/g, '').replace(/:\s*$/, '').trim();
-      // Find the closest line immediately below this label
+      const currCy = (curr.bbox.y0 + curr.bbox.y1) / 2;
+      const currH = Math.max(8, curr.bbox.y1 - curr.bbox.y0);
+
+      // 2A. Check if there is a right-column value on the SAME horizontal row (separated by space)
+      let foundHorizontalValue = false;
+      for (let j = 0; j < sorted.length; j++) {
+        if (i === j) continue;
+        const other = sorted[j];
+        const otherCy = (other.bbox.y0 + other.bbox.y1) / 2;
+        const otherH = Math.max(8, other.bbox.y1 - other.bbox.y0);
+        const sameRow = Math.abs(currCy - otherCy) <= Math.max(currH, otherH) * 0.75;
+        const isToTheRight = other.bbox.x0 >= curr.bbox.x1 - 4;
+
+        if (sameRow && isToTheRight && other.fieldType !== 'label') {
+          const { isColoredBannerBg } = inspectBoxEnvironment(other.bbox);
+          if (!isColoredBannerBg && !isHeaderOrBannerRegex.test(other.text)) {
+            other.fieldType = 'input_value';
+            other.pairedLabel = cleanLabelName;
+            foundHorizontalValue = true;
+
+            // Also check if a multi-line right-column value wraps onto the very next line (e.g. "BISA DITEMUI DAN" / "LAYAK")
+            for (let k = 0; k < sorted.length; k++) {
+              if (k === i || k === j) continue;
+              const wrapped = sorted[k];
+              if (wrapped.fieldType === 'label' || wrapped.pairedLabel) continue;
+              const vGap = wrapped.bbox.y0 - other.bbox.y1;
+              const rightAligned =
+                wrapped.bbox.x0 > imgW * 0.42 ||
+                Math.abs(wrapped.bbox.x1 - other.bbox.x1) <= imgW * 0.08;
+              if (vGap >= -4 && vGap <= otherH * 1.45 && rightAligned) {
+                const { isColoredBannerBg: wrapBanner } = inspectBoxEnvironment(wrapped.bbox);
+                if (!wrapBanner && !isKnownFormLabelRegex.test(wrapped.text)) {
+                  wrapped.fieldType = 'input_value';
+                  wrapped.pairedLabel = cleanLabelName;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (foundHorizontalValue) continue;
+
+      // 2B. Otherwise, look for a stacked input box immediately BELOW this label
       for (let j = i + 1; j < sorted.length; j++) {
         const below = sorted[j];
         const vertGap = below.bbox.y0 - curr.bbox.y1;
@@ -1984,8 +2045,10 @@ export async function autoScanImagesWithOcr(
     const worker = await workerPromise;
     let processedCount = 0;
 
-    // Helper to extract normalized line items from a Tesseract recognize() response
-    const extractLinesFromOcrData = (ocrData: any): RawOcrLineItem[] => {
+    // Helper to extract normalized line items from a Tesseract recognize() response,
+    // automatically splitting lines whenever there is a large horizontal space gap between words
+    // (e.g., two-column "Label ............ Value" rows or "Header ........ Icon")!
+    const extractLinesFromOcrData = (ocrData: any, imageWidth: number): RawOcrLineItem[] => {
       const out: RawOcrLineItem[] = [];
       const extractedLines: any[] = [];
       const extractedWords: any[] = [];
@@ -2011,17 +2074,12 @@ export async function autoScanImagesWithOcr(
 
       const cleanTrailingInputArtifacts = (str: string) =>
         str
-          .replace(/\s+[vV∨⌄▾▿<>|[\]()]{1,2}\s*$/g, '') // Strip dropdown chevron / calendar icon OCR artifacts at right edge of input boxes
+          .replace(/\s+[vV∨⌄▾▿<>|[\]()©®@]{1,2}\s*$/g, '') // Strip dropdown chevron / calendar / icon OCR artifacts at right edge
           .trim();
 
       if (extractedLines.length > 0) {
         for (const line of extractedLines) {
-          const lineText = cleanTrailingInputArtifacts(String(line.text || ''));
-          if (!lineText || lineText.length < 1 || !line.bbox) continue;
-          // Skip single-character noise unless it's a digit
-          if (lineText.length === 1 && !/\d/.test(lineText)) continue;
-
-          const words = Array.isArray(line.words)
+          const rawWords = Array.isArray(line.words)
             ? line.words
                 .filter((w: any) => w?.text && w?.bbox)
                 .map((w: any) => ({
@@ -2033,18 +2091,98 @@ export async function autoScanImagesWithOcr(
                     y1: Number(w.bbox.y1)
                   }
                 }))
-                .filter((w: any) => w.text.length > 0)
+                .filter((w: any) => w.text.length > 0 && !(w.text.length === 1 && !/[a-zA-Z0-9]/.test(w.text)))
+                .sort((a: any, b: any) => a.bbox.x0 - b.bbox.x0)
             : [];
+
+          if (rawWords.length >= 2) {
+            // Segment `rawWords` into horizontal clusters whenever the gap between consecutive words
+            // exceeds a multi-space threshold (`max(20px, lineH * 1.65, imageWidth * 0.055)`).
+            const lineH = Math.max(
+              10,
+              ...rawWords.map((w: any) => Math.max(8, w.bbox.y1 - w.bbox.y0))
+            );
+            const splitGapThreshold = Math.max(20, lineH * 1.65, imageWidth * 0.055);
+
+            const segments: (typeof rawWords)[] = [];
+            let currentSeg: typeof rawWords = [rawWords[0]];
+
+            for (let wIdx = 1; wIdx < rawWords.length; wIdx++) {
+              const prevW = rawWords[wIdx - 1];
+              const currW = rawWords[wIdx];
+              const gapPx = currW.bbox.x0 - prevW.bbox.x1;
+
+              if (gapPx >= splitGapThreshold) {
+                segments.push(currentSeg);
+                currentSeg = [currW];
+              } else {
+                currentSeg.push(currW);
+              }
+            }
+            segments.push(currentSeg);
+
+            // Emit each separated word cluster as its own distinct OCR item with its own tight bounding box!
+            const emittedSegments: RawOcrLineItem[] = [];
+            for (const seg of segments) {
+              const segText = cleanTrailingInputArtifacts(seg.map((w: any) => w.text).join(' '));
+              if (!segText || (segText.length === 1 && !/\d/.test(segText))) continue;
+
+              const segBBox = {
+                x0: Math.min(...seg.map((w: any) => w.bbox.x0)),
+                y0: Math.min(...seg.map((w: any) => w.bbox.y0)),
+                x1: Math.max(...seg.map((w: any) => w.bbox.x1)),
+                y1: Math.max(...seg.map((w: any) => w.bbox.y1))
+              };
+
+              emittedSegments.push({
+                text: segText,
+                bbox: segBBox,
+                words: seg
+              });
+            }
+
+            // If this line split into exactly 2 (or more) horizontal columns on the same row
+            // (e.g., Left = "Tempat Lahir", Right = "BANDUNG"), tag the left segment as `label`
+            // and pre-pair the right segment(s) with that left label!
+            if (emittedSegments.length >= 2) {
+              const leftSeg = emittedSegments[0];
+              const rightSeg = emittedSegments[emittedSegments.length - 1];
+              // Verify left segment starts in the left half of the card and right segment is to its right
+              if (leftSeg.bbox.x0 < imageWidth * 0.45 && rightSeg.bbox.x0 > leftSeg.bbox.x1) {
+                leftSeg.fieldType = 'label';
+                const cleanLeftLabel = leftSeg.text
+                  .replace(/\(\s*\*\s*\)/g, '')
+                  .replace(/:\s*$/, '')
+                  .trim();
+                for (let sIdx = 1; sIdx < emittedSegments.length; sIdx++) {
+                  emittedSegments[sIdx].fieldType = 'input_value';
+                  emittedSegments[sIdx].pairedLabel = cleanLeftLabel;
+                }
+              }
+            }
+
+            out.push(...emittedSegments);
+            continue;
+          }
+
+          const lineText = cleanTrailingInputArtifacts(String(line.text || ''));
+          if (!lineText || lineText.length < 1 || !line.bbox) continue;
+          if (lineText.length === 1 && !/\d/.test(lineText)) continue;
+
+          const tightBBox =
+            rawWords.length === 1
+              ? rawWords[0].bbox
+              : {
+                  x0: Number(line.bbox.x0),
+                  y0: Number(line.bbox.y0),
+                  x1: Number(line.bbox.x1),
+                  y1: Number(line.bbox.y1)
+                };
 
           out.push({
             text: lineText,
-            bbox: {
-              x0: Number(line.bbox.x0),
-              y0: Number(line.bbox.y0),
-              x1: Number(line.bbox.x1),
-              y1: Number(line.bbox.y1)
-            },
-            words
+            bbox: tightBBox,
+            words: rawWords
           });
         }
       } else if (extractedWords.length > 0) {
@@ -2086,7 +2224,7 @@ export async function autoScanImagesWithOcr(
           {},
           { text: true, blocks: true }
         );
-        const pass1Lines = extractLinesFromOcrData(pass1Result?.data);
+        const pass1Lines = extractLinesFromOcrData(pass1Result?.data, imgW);
 
         // Pass 2: Sparse Text (PSM 11) on Border-Cleaned image (captures isolated words inside bordered input boxes & dropdowns like LAGOA, 14270, Buruh, Diploma 3)
         await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
@@ -2095,7 +2233,7 @@ export async function autoScanImagesWithOcr(
           {},
           { text: true, blocks: true }
         );
-        const pass2Lines = extractLinesFromOcrData(pass2Result?.data);
+        const pass2Lines = extractLinesFromOcrData(pass2Result?.data, imgW);
 
         // Reset worker default PSM to 6
         await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
