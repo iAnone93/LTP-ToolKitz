@@ -23,7 +23,12 @@ import {
   CheckCircle2,
   FileImage,
   Hand,
-  PlusSquare
+  PlusSquare,
+  Cpu,
+  Zap,
+  Database,
+  RefreshCw,
+  Filter
 } from 'lucide-react';
 import {
   RedactionRule,
@@ -37,10 +42,17 @@ import {
   createDemoConfidentialPdf,
   parseUserRegexInput,
   autoScanImagesWithOcr,
+  scanSingleImageWithOcr,
   evaluateOcrLinesAgainstRules,
   renderSanitizedImageWithSubBoxes,
-  getOrCreateOcrWorker
+  getOrCreateOcrWorker,
+  OcrEngineType
 } from '../utils/pdfRedactor';
+import {
+  isPaddleModelCached,
+  preloadPaddleModels,
+  clearPaddleModelCache
+} from '../utils/paddleOcrEngine';
 import { generateMultiTierSuggestions, escapeRegex } from '../utils/regexGenerator';
 import { TokenSuggestion } from '../types/regex';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -145,6 +157,17 @@ const PdfRedactor: React.FC = () => {
   const [scanProgress, setScanProgress] = useState<{ current: number; total: number } | null>(null);
   const [ocrStatusText, setOcrStatusText] = useState<string | null>(null);
 
+  // OCR Engine Selection & Model Cache State (Tesseract WASM by default vs PaddleOCR ONNX)
+  const [selectedOcrEngine, setSelectedOcrEngine] = useState<OcrEngineType>(() => {
+    try {
+      const saved = localStorage.getItem('pdf_redactor_ocr_engine');
+      if (saved === 'paddleocr' || saved === 'tesseract') return saved;
+    } catch {}
+    return 'tesseract';
+  });
+  const [isPaddleCached, setIsPaddleCached] = useState<boolean>(false);
+  const [isPreloadingPaddle, setIsPreloadingPaddle] = useState<boolean>(false);
+
   // In-Image OCR & Local Full-Size View Modal State
   const [activeImageModalId, setActiveImageModalId] = useState<string | null>(null);
   const [modalImageZoom, setModalImageZoom] = useState<number>(1.0);
@@ -237,11 +260,16 @@ const PdfRedactor: React.FC = () => {
     setActiveImageModalId(null);
   }, [pdfBuffer]);
 
-  // Load Demo PDF on initial mount and pre-warm the singleton Tesseract OCR worker
+  // Load Demo PDF on initial mount, check PaddleOCR IndexedDB cache status, and pre-warm workers
   useEffect(() => {
     let isMounted = true;
+    isPaddleModelCached().then(cached => {
+      if (isMounted) setIsPaddleCached(cached);
+    }).catch(() => {});
+
     // Pre-warm OCR worker in background
     getOrCreateOcrWorker().catch(() => {});
+
     (async () => {
       try {
         const demoBuffer = await createDemoConfidentialPdf();
@@ -257,6 +285,35 @@ const PdfRedactor: React.FC = () => {
       isMounted = false;
     };
   }, []);
+
+  const handleOcrEngineChange = (engine: OcrEngineType) => {
+    setSelectedOcrEngine(engine);
+    try {
+      localStorage.setItem('pdf_redactor_ocr_engine', engine);
+    } catch {}
+  };
+
+  const handlePreloadPaddle = async () => {
+    setIsPreloadingPaddle(true);
+    setOcrStatusText('Checking PaddleOCR neural models (~6.4 MB)...');
+    try {
+      await preloadPaddleModels((status) => {
+        setOcrStatusText(status);
+      });
+      setIsPaddleCached(true);
+    } catch (err: any) {
+      console.warn('Failed to preload PaddleOCR models:', err);
+    } finally {
+      setIsPreloadingPaddle(false);
+      setOcrStatusText(null);
+    }
+  };
+
+  const handleClearPaddleCache = async () => {
+    if (!window.confirm('Clear cached PaddleOCR models from IndexedDB? They will be re-downloaded when needed.')) return;
+    await clearPaddleModelCache();
+    setIsPaddleCached(false);
+  };
 
   // When PDF buffer or rules change, scan PDF text & images + run automated OCR on embedded images
   useEffect(() => {
@@ -365,7 +422,8 @@ const PdfRedactor: React.FC = () => {
                 })
               );
             },
-            () => isCancelled
+            () => isCancelled,
+            selectedOcrEngine
           );
 
           if (!isCancelled && Object.keys(ocrUpdates).length > 0) {
@@ -437,7 +495,8 @@ const PdfRedactor: React.FC = () => {
               })
             );
           },
-          () => isCancelled
+          () => isCancelled,
+          selectedOcrEngine
         );
 
         if (!isCancelled && Object.keys(ocrUpdates).length > 0) {
@@ -918,16 +977,53 @@ const PdfRedactor: React.FC = () => {
     }));
   };
 
-  const handleRescanSingleImageOcr = async (match: DetectedMatch) => {
-    if (!pdfBuffer) return;
-    setOcrStatusText('Re-scanning image text with OCR...');
+  const handleRescanSingleImageOcr = async (
+    match: DetectedMatch,
+    engineToUse: OcrEngineType = selectedOcrEngine
+  ) => {
+    setSelectedOcrEngine(engineToUse);
     try {
+      localStorage.setItem('pdf_redactor_ocr_engine', engineToUse);
+    } catch {}
+
+    const engineName = engineToUse === 'paddleocr' ? 'PaddleOCR (ONNX)' : 'Tesseract OCR';
+    setOcrStatusText(`Re-scanning with ${engineName}...`);
+
+    try {
+      const imageSrc = match.originalImageDataUrl || match.redactedImageDataUrl;
+      if (imageSrc && match.imagePixelWidth && match.imagePixelHeight) {
+        const res = await scanSingleImageWithOcr(
+          imageSrc,
+          match.imagePixelWidth,
+          match.imagePixelHeight,
+          rules,
+          redactionOptions,
+          engineToUse,
+          status => setOcrStatusText(status)
+        );
+        const upd: Partial<DetectedMatch> = {
+          rawOcrLines: res.rawOcrLines,
+          subBoxes: res.subBoxes,
+          redactedImageDataUrl: res.redactedImageDataUrl,
+          ocrEngineUsed: res.engineUsed
+        };
+        imageOcrCacheRef.current.set(getImageCacheKey(match), upd);
+        setDetectedMatches(prev =>
+          prev.map(m => (m.id === match.id ? { ...m, ...upd } : m))
+        );
+        return;
+      }
+
+      if (!pdfBuffer) return;
       const updates = await autoScanImagesWithOcr(
         pdfBuffer,
         [match],
         rules,
         redactionOptions,
-        status => setOcrStatusText(status)
+        status => setOcrStatusText(status),
+        undefined,
+        undefined,
+        engineToUse
       );
       const upd = updates[match.id];
       if (upd) {
@@ -936,6 +1032,44 @@ const PdfRedactor: React.FC = () => {
           prev.map(m => (m.id === match.id ? { ...m, ...upd } : m))
         );
       }
+    } finally {
+      setOcrStatusText(null);
+    }
+  };
+
+  const handleRescanAllImagesWithEngine = async (engineToUse: OcrEngineType) => {
+    if (!pdfBuffer || isScanning) return;
+    const allImages = detectedMatches.filter(m => m.ruleId === 'embedded_images');
+    if (allImages.length === 0) return;
+
+    setSelectedOcrEngine(engineToUse);
+    try {
+      localStorage.setItem('pdf_redactor_ocr_engine', engineToUse);
+    } catch {}
+
+    imageOcrCacheRef.current.clear();
+    const engineName = engineToUse === 'paddleocr' ? 'PaddleOCR (ONNX)' : 'Tesseract OCR';
+    setOcrStatusText(`Scanning ${allImages.length} images with ${engineName}...`);
+
+    try {
+      const updates = await autoScanImagesWithOcr(
+        pdfBuffer,
+        allImages,
+        rules,
+        redactionOptions,
+        status => setOcrStatusText(status),
+        (matchId, partial) => {
+          setDetectedMatches(prev =>
+            prev.map(m => (m.id === matchId ? { ...m, ...partial } : m))
+          );
+        },
+        undefined,
+        engineToUse
+      );
+
+      setDetectedMatches(prev =>
+        prev.map(m => (updates[m.id] ? { ...m, ...updates[m.id] } : m))
+      );
     } finally {
       setOcrStatusText(null);
     }
@@ -1153,7 +1287,10 @@ const PdfRedactor: React.FC = () => {
           uncachedSelectedImages,
           rules,
           redactionOptions,
-          status => setOcrStatusText(status)
+          status => setOcrStatusText(status),
+          undefined,
+          undefined,
+          selectedOcrEngine
         );
         finalMatchesToExport = allMatches.map(m => {
           const upd = remainingUpdates[m.id];
@@ -1770,6 +1907,94 @@ const PdfRedactor: React.FC = () => {
               <span className="text-xs font-bold text-slate-700 truncate max-w-xs">
                 {fileName}
               </span>
+
+              {/* OCR Engine Switcher (Default: Tesseract.js WASM vs PaddleOCR ONNX) */}
+              <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
+                <button
+                  onClick={() => handleOcrEngineChange('tesseract')}
+                  className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-bold transition-all ${
+                    selectedOcrEngine === 'tesseract'
+                      ? 'bg-indigo-600 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200'
+                  }`}
+                  title="Tesseract.js (WASM): Classic dictionary-driven OCR engine (Default)."
+                >
+                  <Zap size={12} className={selectedOcrEngine === 'tesseract' ? 'text-amber-300' : 'text-slate-500'} />
+                  <span>Tesseract</span>
+                </button>
+                <button
+                  onClick={() => handleOcrEngineChange('paddleocr')}
+                  className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-bold transition-all ${
+                    selectedOcrEngine === 'paddleocr'
+                      ? 'bg-indigo-600 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200'
+                  }`}
+                  title="PaddleOCR (ONNX PP-OCRv6): Deep Learning DBNet text detection & SVTR recognition. SOTA for receipts, tables, IDs, and distorted form text."
+                >
+                  <Cpu size={12} className={selectedOcrEngine === 'paddleocr' ? 'text-indigo-200' : 'text-slate-500'} />
+                  <span>PaddleOCR (ONNX)</span>
+                  {isPaddleCached ? (
+                    <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-500/25 text-emerald-200 font-normal">
+                      Cached
+                    </span>
+                  ) : (
+                    <span className="text-[9px] px-1 py-0.2 rounded bg-slate-200 text-slate-700 font-normal">
+                      ~6.4MB
+                    </span>
+                  )}
+                </button>
+              </div>
+
+              {/* IndexedDB Cache Pill & Action */}
+              {isPaddleCached ? (
+                <div className="hidden lg:flex items-center gap-1 text-[11px] text-slate-600 bg-slate-100 px-2 py-0.5 rounded-lg border border-slate-200">
+                  <Database size={11} className="text-emerald-600" />
+                  <span className="font-semibold text-emerald-700">IndexedDB Ready</span>
+                  <button
+                    onClick={handleClearPaddleCache}
+                    className="ml-1 text-[10px] text-slate-400 hover:text-rose-600 transition-colors"
+                    title="Clear cached models from IndexedDB"
+                  >
+                    (Clear)
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={handlePreloadPaddle}
+                  disabled={isPreloadingPaddle || Boolean(ocrStatusText)}
+                  className="hidden lg:flex items-center gap-1 text-[11px] text-indigo-700 bg-indigo-50 hover:bg-indigo-100 px-2 py-0.5 rounded-lg border border-indigo-200 font-medium transition-colors disabled:opacity-50"
+                  title="Download and cache PP-OCRv6 neural models (~6.4 MB) into IndexedDB for instant offline scans"
+                >
+                  <Database size={11} className={isPreloadingPaddle ? 'animate-bounce text-indigo-600' : 'text-indigo-600'} />
+                  <span>{isPreloadingPaddle ? 'Caching Models...' : 'Preload Cache (~6.4MB)'}</span>
+                </button>
+              )}
+
+              {/* Anomaly Symbol Filter Pill */}
+              <div
+                className="hidden xl:flex items-center gap-1.5 text-[11px] bg-emerald-50 text-emerald-800 px-2 py-0.5 rounded-lg border border-emerald-200"
+                title="Active OCR Pipeline: [1] OCR Read -> [2] Eliminate Anomaly Symbols -> [3] Redact Text. Only (!@#$%^&*) are preserved."
+              >
+                <Filter size={11} className="text-emerald-600 shrink-0" />
+                <span className="font-semibold text-emerald-900">Filter:</span>
+                <span className="font-mono text-[10px] bg-white px-1 py-0.2 rounded border border-emerald-300 font-bold text-emerald-800">
+                  (!@#$%^&*)
+                </span>
+              </div>
+
+              {/* Re-Scan with selected engine if images exist */}
+              {detectedMatches.some(m => m.ruleId === 'embedded_images') && (
+                <button
+                  onClick={() => handleRescanAllImagesWithEngine(selectedOcrEngine)}
+                  disabled={Boolean(ocrStatusText)}
+                  className="px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 border border-slate-200 text-[11px] font-semibold text-slate-700 flex items-center gap-1 transition-colors disabled:opacity-50"
+                  title={`Re-run ${selectedOcrEngine === 'paddleocr' ? 'PaddleOCR' : 'Tesseract'} on all images in this PDF`}
+                >
+                  <RefreshCw size={11} className={ocrStatusText ? 'animate-spin text-indigo-600' : 'text-slate-600'} />
+                  <span className="hidden xl:inline">Re-Scan All</span>
+                </button>
+              )}
+
               {isScanning && (
                 <div className="flex items-center gap-1.5 px-2 py-0.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-full text-[10px] font-semibold">
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping" />
@@ -2358,15 +2583,66 @@ const PdfRedactor: React.FC = () => {
               </div>
 
               <div className="flex items-center gap-2 shrink-0">
-                <button
-                  onClick={() => handleRescanSingleImageOcr(activeImageModalMatch)}
-                  disabled={Boolean(ocrStatusText)}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 flex items-center gap-1.5 transition-colors disabled:opacity-50"
-                  title="Re-run Tesseract OCR text detection on this image"
+                {/* Engine used indicator badge */}
+                {activeImageModalMatch.ocrEngineUsed && (
+                  <span className={`px-2 py-1 rounded-lg text-[10px] font-bold border flex items-center gap-1 ${
+                    activeImageModalMatch.ocrEngineUsed === 'paddleocr'
+                      ? 'bg-purple-950/80 border-purple-500/50 text-purple-300'
+                      : 'bg-amber-950/80 border-amber-500/50 text-amber-300'
+                  }`}>
+                    {activeImageModalMatch.ocrEngineUsed === 'paddleocr' ? (
+                      <>
+                        <Cpu size={11} className="text-purple-400" />
+                        <span>PaddleOCR (ONNX)</span>
+                      </>
+                    ) : (
+                      <>
+                        <Zap size={11} className="text-amber-400" />
+                        <span>Tesseract (WASM)</span>
+                      </>
+                    )}
+                  </span>
+                )}
+
+                {/* Anomaly Filter Active Badge */}
+                <span
+                  className="hidden sm:flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold border border-emerald-500/40 bg-emerald-950/60 text-emerald-300"
+                  title="Pipeline: OCR Read -> Eliminate Anomaly Symbols -> Redact Text. Only (!@#$%^&*) are kept."
                 >
-                  <ScanText size={13} className="text-indigo-400" />
-                  <span>{ocrStatusText ? 'Scanning OCR...' : 'Re-Scan OCR'}</span>
+                  <Filter size={11} className="text-emerald-400" />
+                  <span>Filter: (!@#$%^&*)</span>
+                </span>
+
+                {/* Scan with Tesseract button (Default) */}
+                <button
+                  onClick={() => handleRescanSingleImageOcr(activeImageModalMatch, 'tesseract')}
+                  disabled={Boolean(ocrStatusText)}
+                  className={`px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 transition-colors disabled:opacity-50 ${
+                    activeImageModalMatch.ocrEngineUsed === 'tesseract' || (!activeImageModalMatch.ocrEngineUsed && selectedOcrEngine === 'tesseract')
+                      ? 'bg-amber-600/30 border-amber-500 text-amber-200 hover:bg-amber-600/50'
+                      : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                  }`}
+                  title="Re-run Tesseract OCR (WASM) text detection on this image (Default engine)"
+                >
+                  <Zap size={13} className="text-amber-400" />
+                  <span>{ocrStatusText?.includes('Tesseract') ? 'Scanning...' : 'Scan with Tesseract'}</span>
                 </button>
+
+                {/* Scan with PaddleOCR button */}
+                <button
+                  onClick={() => handleRescanSingleImageOcr(activeImageModalMatch, 'paddleocr')}
+                  disabled={Boolean(ocrStatusText)}
+                  className={`px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 transition-colors disabled:opacity-50 ${
+                    activeImageModalMatch.ocrEngineUsed === 'paddleocr'
+                      ? 'bg-indigo-600/30 border-indigo-500 text-indigo-200 hover:bg-indigo-600/50'
+                      : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                  }`}
+                  title="Re-run PaddleOCR (ONNX PP-OCRv6) neural text detection on this image"
+                >
+                  <Cpu size={13} className="text-indigo-400" />
+                  <span>{ocrStatusText?.includes('PaddleOCR') ? 'Scanning...' : 'Scan with PaddleOCR'}</span>
+                </button>
+
                 <button
                   onClick={() => setActiveImageModalId(null)}
                   className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
@@ -2738,6 +3014,15 @@ const PdfRedactor: React.FC = () => {
                       <span>
                         OCR Detected Fields ({(activeImageModalMatch.subBoxes || []).length})
                       </span>
+                      {activeImageModalMatch.ocrEngineUsed && (
+                        <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold ${
+                          activeImageModalMatch.ocrEngineUsed === 'paddleocr'
+                            ? 'bg-purple-100 text-purple-800 border border-purple-200'
+                            : 'bg-amber-100 text-amber-800 border border-amber-200'
+                        }`}>
+                          {activeImageModalMatch.ocrEngineUsed === 'paddleocr' ? 'PaddleOCR' : 'Tesseract'}
+                        </span>
+                      )}
                     </span>
                     <div className="flex items-center gap-1.5 text-[10px]">
                       <button

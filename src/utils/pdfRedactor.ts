@@ -16,6 +16,25 @@ export interface RedactionRule {
 }
 
 export type OcrFieldType = 'input_value' | 'label' | 'header_or_note';
+export type OcrEngineType = 'tesseract' | 'paddleocr';
+export const DEFAULT_OCR_ENGINE: OcrEngineType = 'tesseract';
+
+import { runPaddleOcrOnImage } from './paddleOcrEngine';
+import {
+  eliminateAnomalySymbols,
+  hasMeaningfulContent,
+  cleanOcrWords,
+  ALLOWED_OCR_SYMBOLS,
+  separateLineBySymbolsAndDelimiters
+} from './ocrSanitizer';
+
+export {
+  eliminateAnomalySymbols,
+  hasMeaningfulContent,
+  cleanOcrWords,
+  ALLOWED_OCR_SYMBOLS,
+  separateLineBySymbolsAndDelimiters
+};
 
 export interface InImageSubBox {
   id: string;
@@ -68,6 +87,7 @@ export interface DetectedMatch {
   imagePixelHeight?: number;
   rawOcrLines?: RawOcrLineItem[];
   subBoxes?: InImageSubBox[];
+  ocrEngineUsed?: OcrEngineType;
   createLocalFullSizePage?: boolean;
 }
 
@@ -83,7 +103,7 @@ export const DEFAULT_REDACTION_RULES: RedactionRule[] = [
     id: 'email',
     name: 'Email Addresses',
     category: 'email',
-    pattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}',
+    pattern: '[a-zA-Z0-9_%+-]+@[a-zA-Z0-9-]+(?:[.\\s]+[a-zA-Z]{2,})?',
     flags: 'gi',
     description: 'Corporate and personal email addresses (e.g., support@corp.com)',
     enabled: true,
@@ -113,7 +133,7 @@ export const DEFAULT_REDACTION_RULES: RedactionRule[] = [
     id: 'identity_ssn',
     name: 'Identity / SSN / NIK',
     category: 'identity',
-    pattern: '\\b\\d{3}-\\d{2}-\\d{4}\\b|\\b\\d{16}\\b',
+    pattern: '\\b\\d{3}[-\\s]?\\d{2}[-\\s]?\\d{4}\\b|\\b\\d{16}\\b',
     flags: 'g',
     description: 'Social Security Numbers (9 digits) and national IDs (16 digits)',
     enabled: true,
@@ -133,7 +153,7 @@ export const DEFAULT_REDACTION_RULES: RedactionRule[] = [
     id: 'currency',
     name: 'Currency & Balances',
     category: 'financial',
-    pattern: '(?:\\$|Rp|EUR|USD|GBP|\\bIDR\\b)\\s?[-+]?\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d{2})?',
+    pattern: '(?:\\$|Rp|EUR|USD|GBP|\\bIDR\\b)\\s?[-+]?\\d{1,3}(?:[.,\\s]\\d{3})*(?:[.,\\s]\\d{2})?',
     flags: 'gi',
     description: 'Dollar, Euro, Rupiah, and financial balances',
     enabled: false,
@@ -1441,6 +1461,24 @@ async function prepareImageForHighSensitivityOcr(
   });
 }
 
+
+
+export const isKnownFormLabelRegex =
+  /^(id\s+pipeline|sektor\s+ekonomi|sub\s+sektor|jenis\s+usaha|status\s+perkawinan|status\s+tempat|alamat\s+identitas|alamat|kelurahan|kecamatan|kode\s+pos|kode\s+pekerjaan|kode\s+status|pendidikan|gelar|nama\s+nasabah|nama\s+aom|nip\s+aom|tempat\s+lahir|tanggal\s+lahir|jenis\s+kelamin|lama\s+usaha|rencana\s+plafon|no\.?\s*telepon|no\.?\s*hp|telepon|email|keterangan|nomor|nik|npwp|label|field)\b/i;
+
+export const isHeaderOrBannerRegex =
+  /\b(form\s+data|form\s+uji|uji\s+kelayakan|detail\s+informasi|daftar\s+prospek|save\s+draft|back|home|inisiasi|baru\s*-\s*baru|pilih\s+awal|pilih\s+akhir|pilih\s+periode|network\s+elements|keep\s+log|disable|enable)\b/i;
+
+export function isFormLabelCandidate(str: string): boolean {
+  const trimmed = str.trim();
+  if (isHeaderOrBannerRegex.test(trimmed)) return false;
+  return (
+    /:\s*$/.test(trimmed) ||
+    /\(\s*\*\s*\)/.test(trimmed) ||
+    isKnownFormLabelRegex.test(trimmed)
+  );
+}
+
 /**
  * Inspect the original image's pixels and text syntax to classify each OCR line as:
  * - `'input_value'`: Text inside a bordered form input box or dropdown (`LAGOA`, `14270`, `Buruh`, `1997-08-04`, `Test5`, `BELUM KAWIN`)
@@ -1455,8 +1493,23 @@ function classifyAndPairOcrLines(
 ): RawOcrLineItem[] {
   if (lines.length === 0) return lines;
 
+  // Step 2 & 3: Eliminate Anomaly Symbols across all incoming lines AND
+  // separate text wherever an anomaly symbol or colon/semicolon/delimiter was positioned
+  // (e.g. 'auto山 detect' -> 'auto' and 'detect'; 'langsung: {id: 234' -> 'langsung', 'id', and '234')
+  const sanitizedLines: RawOcrLineItem[] = [];
+  for (const line of lines) {
+    const pieces = separateLineBySymbolsAndDelimiters(line);
+    for (const piece of pieces) {
+      if (hasMeaningfulContent(piece.text)) {
+        sanitizedLines.push(piece);
+      }
+    }
+  }
+
+  if (sanitizedLines.length === 0) return [];
+
   // Sort lines top-to-bottom by vertical center
-  const sorted = [...lines].sort(
+  const sorted = [...sanitizedLines].sort(
     (a, b) => (a.bbox.y0 + a.bbox.y1) / 2 - (b.bbox.y0 + b.bbox.y1) / 2
   );
 
@@ -1562,13 +1615,7 @@ function classifyAndPairOcrLines(
     return { isWhiteInputBox, isColoredBannerBg: false };
   };
 
-  // Explicit syntax patterns for labels, helper notes, and UI chrome
-  const isRequiredMarkerLabel = /\(\s*\*\s*\)|:\s*$/;
   const isHelperNoteRegex = /^\*|\b(wajib|maximum|maksimum|sesuai dengan|apakah)\b/i;
-  const isKnownFormLabelRegex =
-    /^(id\s+pipeline|sektor\s+ekonomi|sub\s+sektor|jenis\s+usaha|status\s+perkawinan|status\s+tempat|alamat\s+identitas|alamat|kelurahan|kecamatan|kode\s+pos|kode\s+pekerjaan|kode\s+status|pendidikan|gelar|nama\s+nasabah|nama\s+aom|nip\s+aom|tempat\s+lahir|tanggal\s+lahir|jenis\s+kelamin|lama\s+usaha|rencana\s+plafon|no\.?\s*telepon|no\.?\s*hp|telepon|email|keterangan|nomor|nik|npwp)\b/i;
-  const isHeaderOrBannerRegex =
-    /\b(form\s+data|form\s+uji|uji\s+kelayakan|detail\s+informasi|daftar\s+prospek|save\s+draft|back|home|inisiasi|baru\s*-\s*baru)\b/i;
   const isStatusBarRegex = /\b\d{1,2}:\d{2}\b.*%|\b(4g|5g|lte|wifi)\b/i;
 
   for (const item of sorted) {
@@ -1582,15 +1629,11 @@ function classifyAndPairOcrLines(
       isHelperNoteRegex.test(t)
     ) {
       item.fieldType = 'header_or_note';
-    } else if (isRequiredMarkerLabel.test(t) || isKnownFormLabelRegex.test(t)) {
+    } else if (item.fieldType === 'label' || isFormLabelCandidate(t)) {
       item.fieldType = 'label';
-    } else if (isWhiteInputBox) {
-      item.fieldType = 'input_value';
-    } else if (item.pairedLabel) {
-      // Already paired horizontally via wide-gap column split (e.g., left label + right value on the same row)
+    } else if (item.fieldType === 'input_value' || item.pairedLabel || isWhiteInputBox) {
       item.fieldType = 'input_value';
     } else {
-      // Default to header_or_note unless paired horizontally or vertically with a Form Label in Pass 2
       item.fieldType = 'header_or_note';
     }
   }
@@ -1703,7 +1746,18 @@ export function evaluateOcrLinesAgainstRules(
   const subBoxes: InImageSubBox[] = [...customBoxes];
   let subIdx = 0;
 
+  // Pipeline Step 2: Ensure any raw OCR lines with colons or anomaly symbols are strictly separated
+  const normalizedOcrLines: RawOcrLineItem[] = [];
   for (const line of rawOcrLines) {
+    const pieces = separateLineBySymbolsAndDelimiters(line);
+    for (const piece of pieces) {
+      if (hasMeaningfulContent(piece.text)) {
+        normalizedOcrLines.push(piece);
+      }
+    }
+  }
+
+  for (const line of normalizedOcrLines) {
     const lineText = String(line.text || '').trim();
     if (!lineText || lineText.length < 2) continue;
     const bbox = line.bbox;
@@ -1894,10 +1948,144 @@ export function evaluateOcrLinesAgainstRules(
   return subBoxes;
 }
 
+// Helper to extract normalized line items from a Tesseract recognize() response,
+// automatically splitting lines whenever there is a large horizontal space gap between words
+// (e.g., two-column "Label ............ Value" rows or "Header ........ Icon")!
+function extractLinesFromOcrData(ocrData: any, imageWidth: number): RawOcrLineItem[] {
+  const out: RawOcrLineItem[] = [];
+  const extractedLines: any[] = [];
+  const extractedWords: any[] = [];
+
+  if (Array.isArray(ocrData?.blocks)) {
+    for (const block of ocrData.blocks) {
+      for (const para of block?.paragraphs || []) {
+        for (const line of para?.lines || []) {
+          extractedLines.push(line);
+          for (const word of line?.words || []) {
+            extractedWords.push(word);
+          }
+        }
+      }
+    }
+  }
+  if (extractedLines.length === 0 && Array.isArray(ocrData?.lines)) {
+    extractedLines.push(...ocrData.lines);
+  }
+  if (extractedWords.length === 0 && Array.isArray(ocrData?.words)) {
+    extractedWords.push(...ocrData.words);
+  }
+
+
+
+  if (extractedLines.length > 0) {
+    for (const line of extractedLines) {
+      // Pipeline Step 2: Separate text wherever an anomaly symbol or colon/semicolon appears,
+      // and eliminate anomaly symbols to strictly preserve only (!@#$%^&*), letters, numbers, and spaces.
+      const rawText = String(line.text || '').trim();
+      const rawWords = Array.isArray(line.words)
+        ? line.words.filter((w: any) => w?.text && w?.bbox)
+        : [];
+
+      const pieces = separateLineBySymbolsAndDelimiters({
+        text: rawText,
+        bbox: line.bbox,
+        words: rawWords
+      });
+
+      for (const piece of pieces) {
+        if (
+          !hasMeaningfulContent(piece.text) ||
+          (piece.text.length === 1 && !/[a-zA-Z0-9]/.test(piece.text))
+        ) {
+          continue;
+        }
+
+        // If piece has multiple words, check if there's an unusually large horizontal gap (e.g. multi-column layout)
+        const pWords = piece.words || [];
+        if (pWords.length >= 2) {
+          const lineH = Math.max(10, ...pWords.map((w: any) => Math.max(8, w.bbox.y1 - w.bbox.y0)));
+          const splitGapThreshold = Math.max(25, lineH * 1.8, imageWidth * 0.065);
+
+          const segments: (typeof pWords)[] = [];
+          let currentSeg: typeof pWords = [pWords[0]];
+
+          for (let wIdx = 1; wIdx < pWords.length; wIdx++) {
+            const prevW = pWords[wIdx - 1];
+            const currW = pWords[wIdx];
+            const gapPx = currW.bbox.x0 - prevW.bbox.x1;
+
+            if (gapPx >= splitGapThreshold) {
+              segments.push(currentSeg);
+              currentSeg = [currW];
+            } else {
+              currentSeg.push(currW);
+            }
+          }
+          segments.push(currentSeg);
+
+          if (segments.length > 1) {
+            for (let sIdx = 0; sIdx < segments.length; sIdx++) {
+              const seg = segments[sIdx];
+              const segText = eliminateAnomalySymbols(seg.map((w: any) => w.text).join(' '));
+              if (!hasMeaningfulContent(segText) || (segText.length === 1 && !/\d/.test(segText)))
+                continue;
+
+              const segBBox = {
+                x0: Math.min(...seg.map((w: any) => w.bbox.x0)),
+                y0: Math.min(...seg.map((w: any) => w.bbox.y0)),
+                x1: Math.max(...seg.map((w: any) => w.bbox.x1)),
+                y1: Math.max(...seg.map((w: any) => w.bbox.y1))
+              };
+
+              out.push({
+                text: segText,
+                bbox: segBBox,
+                words: seg,
+                fieldType: sIdx === 0 ? piece.fieldType : 'input_value',
+                pairedLabel: sIdx === 0 ? piece.pairedLabel : piece.text
+              });
+            }
+            continue;
+          }
+        }
+
+        out.push(piece);
+      }
+    }
+  } else if (extractedWords.length > 0) {
+    for (const w of extractedWords) {
+      const rawWText = String(w.text || '').trim();
+      if (!rawWText || !w.bbox) continue;
+
+      const pieces = separateLineBySymbolsAndDelimiters({
+        text: rawWText,
+        bbox: {
+          x0: Number(w.bbox.x0),
+          y0: Number(w.bbox.y0),
+          x1: Number(w.bbox.x1),
+          y1: Number(w.bbox.y1)
+        },
+        words: [w]
+      });
+
+      for (const piece of pieces) {
+        if (
+          hasMeaningfulContent(piece.text) &&
+          !(piece.text.length === 1 && !/[a-zA-Z0-9]/.test(piece.text))
+        ) {
+          out.push(piece);
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
 /**
  * Automatically extract full-resolution uncropped images for all detected Embedded Image matches,
  * stream the extracted image immediately so the modal never waits,
- * and run Tesseract OCR with a reusable singleton worker to create selective in-image redaction subBoxes
+ * and run PaddleOCR (ONNX) or Tesseract OCR to create selective in-image redaction subBoxes
  * strictly matching the user's active Regex & Detection Rules!
  */
 export async function autoScanImagesWithOcr(
@@ -1907,175 +2095,23 @@ export async function autoScanImagesWithOcr(
   redactionOptions: RedactionStyleOptions,
   onProgress?: (statusText: string) => void,
   onPartialUpdate?: (matchId: string, partial: Partial<DetectedMatch>) => void,
-  shouldCancel?: () => boolean
+  shouldCancel?: () => boolean,
+  engine: OcrEngineType = 'tesseract'
 ): Promise<Record<string, Partial<DetectedMatch>>> {
   if (typeof document === 'undefined' || imageMatches.length === 0) return {};
 
   const updates: Record<string, Partial<DetectedMatch>> = {};
 
   try {
-    // Kick off worker warm-up in parallel while loading the PDF document
-    const workerPromise = getOrCreateOcrWorker();
+    // Warm up Tesseract worker if that's the selected engine
+    if (engine === 'tesseract') {
+      getOrCreateOcrWorker().catch(() => {});
+    }
 
     const [pdfDoc, pdfLibDoc] = await Promise.all([
       pdfjsLib.getDocument({ data: pdfBuffer.slice(0), verbosity: 0 }).promise,
       PDFDocument.load(pdfBuffer.slice(0)).catch(() => null)
     ]);
-
-    const worker = await workerPromise;
-
-    // Helper to extract normalized line items from a Tesseract recognize() response,
-    // automatically splitting lines whenever there is a large horizontal space gap between words
-    // (e.g., two-column "Label ............ Value" rows or "Header ........ Icon")!
-    const extractLinesFromOcrData = (ocrData: any, imageWidth: number): RawOcrLineItem[] => {
-      const out: RawOcrLineItem[] = [];
-      const extractedLines: any[] = [];
-      const extractedWords: any[] = [];
-
-      if (Array.isArray(ocrData?.blocks)) {
-        for (const block of ocrData.blocks) {
-          for (const para of block?.paragraphs || []) {
-            for (const line of para?.lines || []) {
-              extractedLines.push(line);
-              for (const word of line?.words || []) {
-                extractedWords.push(word);
-              }
-            }
-          }
-        }
-      }
-      if (extractedLines.length === 0 && Array.isArray(ocrData?.lines)) {
-        extractedLines.push(...ocrData.lines);
-      }
-      if (extractedWords.length === 0 && Array.isArray(ocrData?.words)) {
-        extractedWords.push(...ocrData.words);
-      }
-
-      const cleanTrailingInputArtifacts = (str: string) =>
-        str
-          .replace(/\s+[vV∨⌄▾▿<>|[\]()©®@]{1,2}\s*$/g, '') // Strip dropdown chevron / calendar / icon OCR artifacts at right edge
-          .trim();
-
-      if (extractedLines.length > 0) {
-        for (const line of extractedLines) {
-          const rawWords = Array.isArray(line.words)
-            ? line.words
-                .filter((w: any) => w?.text && w?.bbox)
-                .map((w: any) => ({
-                  text: cleanTrailingInputArtifacts(String(w.text)),
-                  bbox: {
-                    x0: Number(w.bbox.x0),
-                    y0: Number(w.bbox.y0),
-                    x1: Number(w.bbox.x1),
-                    y1: Number(w.bbox.y1)
-                  }
-                }))
-                .filter((w: any) => w.text.length > 0 && !(w.text.length === 1 && !/[a-zA-Z0-9]/.test(w.text)))
-                .sort((a: any, b: any) => a.bbox.x0 - b.bbox.x0)
-            : [];
-
-          if (rawWords.length >= 2) {
-            const lineH = Math.max(
-              10,
-              ...rawWords.map((w: any) => Math.max(8, w.bbox.y1 - w.bbox.y0))
-            );
-            const splitGapThreshold = Math.max(20, lineH * 1.65, imageWidth * 0.055);
-
-            const segments: (typeof rawWords)[] = [];
-            let currentSeg: typeof rawWords = [rawWords[0]];
-
-            for (let wIdx = 1; wIdx < rawWords.length; wIdx++) {
-              const prevW = rawWords[wIdx - 1];
-              const currW = rawWords[wIdx];
-              const gapPx = currW.bbox.x0 - prevW.bbox.x1;
-
-              if (gapPx >= splitGapThreshold) {
-                segments.push(currentSeg);
-                currentSeg = [currW];
-              } else {
-                currentSeg.push(currW);
-              }
-            }
-            segments.push(currentSeg);
-
-            const emittedSegments: RawOcrLineItem[] = [];
-            for (const seg of segments) {
-              const segText = cleanTrailingInputArtifacts(seg.map((w: any) => w.text).join(' '));
-              if (!segText || (segText.length === 1 && !/\d/.test(segText))) continue;
-
-              const segBBox = {
-                x0: Math.min(...seg.map((w: any) => w.bbox.x0)),
-                y0: Math.min(...seg.map((w: any) => w.bbox.y0)),
-                x1: Math.max(...seg.map((w: any) => w.bbox.x1)),
-                y1: Math.max(...seg.map((w: any) => w.bbox.y1))
-              };
-
-              emittedSegments.push({
-                text: segText,
-                bbox: segBBox,
-                words: seg
-              });
-            }
-
-            if (emittedSegments.length >= 2) {
-              const leftSeg = emittedSegments[0];
-              const rightSeg = emittedSegments[emittedSegments.length - 1];
-              if (leftSeg.bbox.x0 < imageWidth * 0.45 && rightSeg.bbox.x0 > leftSeg.bbox.x1) {
-                leftSeg.fieldType = 'label';
-                const cleanLeftLabel = leftSeg.text
-                  .replace(/\(\s*\*\s*\)/g, '')
-                  .replace(/:\s*$/, '')
-                  .trim();
-                for (let sIdx = 1; sIdx < emittedSegments.length; sIdx++) {
-                  emittedSegments[sIdx].fieldType = 'input_value';
-                  emittedSegments[sIdx].pairedLabel = cleanLeftLabel;
-                }
-              }
-            }
-
-            out.push(...emittedSegments);
-            continue;
-          }
-
-          const lineText = cleanTrailingInputArtifacts(String(line.text || ''));
-          if (!lineText || lineText.length < 1 || !line.bbox) continue;
-          if (lineText.length === 1 && !/\d/.test(lineText)) continue;
-
-          const tightBBox =
-            rawWords.length === 1
-              ? rawWords[0].bbox
-              : {
-                  x0: Number(line.bbox.x0),
-                  y0: Number(line.bbox.y0),
-                  x1: Number(line.bbox.x1),
-                  y1: Number(line.bbox.y1)
-                };
-
-          out.push({
-            text: lineText,
-            bbox: tightBBox,
-            words: rawWords
-          });
-        }
-      } else if (extractedWords.length > 0) {
-        for (const w of extractedWords) {
-          const wText = cleanTrailingInputArtifacts(String(w.text || ''));
-          if (!wText || (wText.length === 1 && !/\d/.test(wText)) || !w.bbox) continue;
-          const wb = {
-            x0: Number(w.bbox.x0),
-            y0: Number(w.bbox.y0),
-            x1: Number(w.bbox.x1),
-            y1: Number(w.bbox.y1)
-          };
-          out.push({
-            text: wText,
-            bbox: wb,
-            words: [{ text: wText, bbox: wb }]
-          });
-        }
-      }
-      return out;
-    };
 
     // Group image matches by pageIndex
     const byPage = new Map<number, DetectedMatch[]>();
@@ -2088,8 +2124,6 @@ export async function autoScanImagesWithOcr(
     const totalImages = imageMatches.length;
     let processedCount = 0;
 
-    // Stream extraction + OCR immediately image-by-image so the UI updates live ("1 of N...")
-    // and never blocks in an upfront 225-image extraction queue!
     for (const [pageIdx, pageImgMatches] of byPage.entries()) {
       if (shouldCancel?.()) break;
 
@@ -2103,9 +2137,10 @@ export async function autoScanImagesWithOcr(
 
         const imgMatch = pageImgMatches[mIdx];
         processedCount++;
+        const engineLabel = engine === 'paddleocr' ? 'PaddleOCR (ONNX)' : 'Tesseract OCR';
         if (onProgress) {
           onProgress(
-            `OCR scanning image ${processedCount} of ${totalImages} (Page ${pageIdx + 1})...`
+            `${engineLabel} scanning image ${processedCount} of ${totalImages} (Page ${pageIdx + 1})...`
           );
         }
 
@@ -2113,8 +2148,7 @@ export async function autoScanImagesWithOcr(
         let imgW = 0;
         let imgH = 0;
 
-        // 0. HIGHEST PRIORITY: If the PDF thumbnail has a linked full-size image URL (e.g., CloudFront / S3),
-        // fetch the true full-resolution uncropped original image via `/api/proxy-image`!
+        // 0. HIGHEST PRIORITY: If the PDF thumbnail has a linked full-size image URL, fetch via proxy
         if (imgMatch.linkedUri) {
           const linkedOriginal = await tryFetchLinkedOriginalImage(imgMatch.linkedUri);
           if (linkedOriginal) {
@@ -2124,7 +2158,7 @@ export async function autoScanImagesWithOcr(
           }
         }
 
-        // 1. Second priority: Raw uncropped PDF XObject stream from pdf-lib (bypasses PDF clipping paths!)
+        // 1. Second priority: Raw uncropped PDF XObject stream from pdf-lib
         if (!baseDataUrl) {
           const rawXObj =
             rawPageXObjects[mIdx] || (rawPageXObjects.length === 1 ? rawPageXObjects[0] : null);
@@ -2145,7 +2179,7 @@ export async function autoScanImagesWithOcr(
           }
         }
 
-        // 3. Fallback: High-DPI sub-viewport render using UNCLIPPED coordinates so clipped thumbnails render in full
+        // 3. Fallback: High-DPI sub-viewport render using UNCLIPPED coordinates
         if (!baseDataUrl || imgW < 16 || imgH < 16) {
           const targetBoxX = imgMatch.unclippedX ?? imgMatch.x;
           const targetBoxY = imgMatch.unclippedY ?? imgMatch.y;
@@ -2175,7 +2209,6 @@ export async function autoScanImagesWithOcr(
           await page.render({ canvasContext: cropCtx, viewport: croppedViewport }).promise;
           baseDataUrl = cropCanvas.toDataURL('image/png');
 
-          // Retry native XObject extraction right after page.render (since page.render populates page.objs!)
           if (imgMatch.imageObjId) {
             const postRenderNative = await extractNativePdfImageObject(page, imgMatch.imageObjId);
             if (postRenderNative) {
@@ -2204,63 +2237,92 @@ export async function autoScanImagesWithOcr(
 
         let rawOcrLines: RawOcrLineItem[] = [];
         let subBoxes: InImageSubBox[] = [];
+        let usedEngine: OcrEngineType = engine;
+
         try {
           const { borderCleanedDataUrl, pixelData } = await prepareImageForHighSensitivityOcr(
             baseDataUrl
           );
 
-          // Pass 1: Standard Page Segmentation (PSM 6 - Uniform Block) on original image
-          await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
-          const pass1Result = await worker.recognize(
-            baseDataUrl,
-            {},
-            { text: true, blocks: true }
-          );
-          const pass1Lines = extractLinesFromOcrData(pass1Result?.data, imgW);
-
-          // For large batch PDFs (> 12 images), only run Pass 2 if Pass 1 found fewer than 8 lines,
-          // cutting OCR time in half while keeping full dual-pass sensitivity when needed!
-          let pass2Lines: RawOcrLineItem[] = [];
-          if (totalImages <= 12 || pass1Lines.length < 8) {
-            await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
-            const pass2Result = await worker.recognize(
-              borderCleanedDataUrl,
-              {},
-              { text: true, blocks: true }
-            );
-            pass2Lines = extractLinesFromOcrData(pass2Result?.data, imgW);
-            await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
-          }
-
-          const mergedLines: RawOcrLineItem[] = [...pass1Lines];
-          for (const cand of pass2Lines) {
-            const candCy = (cand.bbox.y0 + cand.bbox.y1) / 2;
-            const candH = Math.max(8, cand.bbox.y1 - cand.bbox.y0);
-
-            const alreadyExists = mergedLines.some((ex) => {
-              const exCy = (ex.bbox.y0 + ex.bbox.y1) / 2;
-              const sameRow =
-                Math.abs(candCy - exCy) < Math.max(candH, ex.bbox.y1 - ex.bbox.y0) * 0.65;
-              if (!sameRow) return false;
-
-              const overlapX = Math.max(
-                0,
-                Math.min(cand.bbox.x1, ex.bbox.x1) - Math.max(cand.bbox.x0, ex.bbox.x0)
+          if (engine === 'paddleocr') {
+            try {
+              onProgress?.(
+                `PaddleOCR scanning image ${processedCount}/${totalImages}: [1/3] Reading text -> [2/3] Eliminating anomaly symbols (!@#$%^&*) -> [3/3] Redacting...`
               );
-              const minW = Math.max(
-                1,
-                Math.min(cand.bbox.x1 - cand.bbox.x0, ex.bbox.x1 - ex.bbox.x0)
+              const paddleRes = await runPaddleOcrOnImage(
+                baseDataUrl,
+                imgW,
+                imgH,
+                status => onProgress?.(`[Image ${processedCount}/${totalImages}] ${status}`)
               );
-              return overlapX / minW > 0.45;
-            });
-
-            if (!alreadyExists) {
-              mergedLines.push(cand);
+              onProgress?.(
+                `[Image ${processedCount}/${totalImages}] [2/3] Anomaly symbols eliminated (!@#$%^&* kept) • [3/3] Classifying and auto-redacting values...`
+              );
+              rawOcrLines = classifyAndPairOcrLines(paddleRes.lines, pixelData, imgW, imgH);
+              subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imgW, imgH);
+              usedEngine = 'paddleocr';
+            } catch (paddleErr) {
+              console.warn('PaddleOCR failed on image, falling back to Tesseract:', paddleErr);
+              usedEngine = 'tesseract';
             }
           }
 
-          rawOcrLines = classifyAndPairOcrLines(mergedLines, pixelData, imgW, imgH);
-          subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imgW, imgH);
+          if (usedEngine === 'tesseract' || rawOcrLines.length === 0) {
+            onProgress?.(
+              `Tesseract OCR scanning image ${processedCount}/${totalImages}: [1/3] Reading text -> [2/3] Eliminating anomaly symbols (!@#$%^&*) -> [3/3] Redacting...`
+            );
+            const worker = await getOrCreateOcrWorker();
+            await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
+            const pass1Result = await worker.recognize(
+              baseDataUrl,
+              {},
+              { text: true, blocks: true }
+            );
+            const pass1Lines = extractLinesFromOcrData(pass1Result?.data, imgW);
+
+            let pass2Lines: RawOcrLineItem[] = [];
+            if (totalImages <= 12 || pass1Lines.length < 8) {
+              await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
+              const pass2Result = await worker.recognize(
+                borderCleanedDataUrl,
+                {},
+                { text: true, blocks: true }
+              );
+              pass2Lines = extractLinesFromOcrData(pass2Result?.data, imgW);
+              await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
+            }
+
+            const mergedLines: RawOcrLineItem[] = [...pass1Lines];
+            for (const cand of pass2Lines) {
+              const candCy = (cand.bbox.y0 + cand.bbox.y1) / 2;
+              const candH = Math.max(8, cand.bbox.y1 - cand.bbox.y0);
+
+              const alreadyExists = mergedLines.some((ex) => {
+                const exCy = (ex.bbox.y0 + ex.bbox.y1) / 2;
+                const sameRow =
+                  Math.abs(candCy - exCy) < Math.max(candH, ex.bbox.y1 - ex.bbox.y0) * 0.65;
+                if (!sameRow) return false;
+
+                const overlapX = Math.max(
+                  0,
+                  Math.min(cand.bbox.x1, ex.bbox.x1) - Math.max(cand.bbox.x0, ex.bbox.x0)
+                );
+                const minW = Math.max(
+                  1,
+                  Math.min(cand.bbox.x1 - cand.bbox.x0, ex.bbox.x1 - ex.bbox.x0)
+                );
+                return overlapX / minW > 0.45;
+              });
+
+              if (!alreadyExists) {
+                mergedLines.push(cand);
+              }
+            }
+
+            rawOcrLines = classifyAndPairOcrLines(mergedLines, pixelData, imgW, imgH);
+            subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imgW, imgH);
+            usedEngine = 'tesseract';
+          }
         } catch (ocrErr) {
           console.warn('OCR scan warning on image', ocrErr);
         }
@@ -2278,6 +2340,7 @@ export async function autoScanImagesWithOcr(
           imagePixelHeight: imgH,
           rawOcrLines,
           subBoxes,
+          ocrEngineUsed: usedEngine,
           imageMode: 'partial',
           createLocalFullSizePage: true
         };
@@ -2293,6 +2356,104 @@ export async function autoScanImagesWithOcr(
   }
 
   return updates;
+}
+
+/**
+ * Scan a single image directly with the specified OCR engine (PaddleOCR ONNX or Tesseract WASM).
+ * Used for instant on-demand re-scanning inside the Full-Size Image Modal.
+ */
+export async function scanSingleImageWithOcr(
+  imageDataUrl: string,
+  imageWidth: number,
+  imageHeight: number,
+  rules: RedactionRule[],
+  redactionOptions: RedactionStyleOptions,
+  engine: OcrEngineType = 'tesseract',
+  onProgress?: (statusText: string) => void
+): Promise<{
+  rawOcrLines: RawOcrLineItem[];
+  subBoxes: InImageSubBox[];
+  redactedImageDataUrl: string;
+  engineUsed: OcrEngineType;
+}> {
+  let rawOcrLines: RawOcrLineItem[] = [];
+  let subBoxes: InImageSubBox[] = [];
+  let usedEngine: OcrEngineType = engine;
+
+  const { borderCleanedDataUrl, pixelData } = await prepareImageForHighSensitivityOcr(
+    imageDataUrl
+  );
+
+  if (engine === 'paddleocr') {
+    try {
+      onProgress?.('PaddleOCR: [1/3] Reading text -> [2/3] Eliminating anomaly symbols (!@#$%^&*) -> [3/3] Redacting...');
+      const paddleRes = await runPaddleOcrOnImage(
+        imageDataUrl,
+        imageWidth,
+        imageHeight,
+        status => onProgress?.(status)
+      );
+      onProgress?.('[2/3] Anomaly symbols eliminated (!@#$%^&* kept) • [3/3] Redacting detected fields...');
+      rawOcrLines = classifyAndPairOcrLines(paddleRes.lines, pixelData, imageWidth, imageHeight);
+      subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imageWidth, imageHeight);
+      usedEngine = 'paddleocr';
+    } catch (paddleErr) {
+      console.warn('PaddleOCR failed on single image, falling back to Tesseract:', paddleErr);
+      usedEngine = 'tesseract';
+    }
+  }
+
+  if (usedEngine === 'tesseract' || rawOcrLines.length === 0) {
+    onProgress?.('Tesseract OCR: [1/3] Reading text -> [2/3] Eliminating anomaly symbols (!@#$%^&*) -> [3/3] Redacting...');
+    const worker = await getOrCreateOcrWorker();
+    await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
+    const pass1Result = await worker.recognize(
+      imageDataUrl,
+      {},
+      { text: true, blocks: true }
+    );
+    const pass1Lines = extractLinesFromOcrData(pass1Result?.data, imageWidth);
+
+    await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
+    const pass2Result = await worker.recognize(
+      borderCleanedDataUrl,
+      {},
+      { text: true, blocks: true }
+    );
+    const pass2Lines = extractLinesFromOcrData(pass2Result?.data, imageWidth);
+    await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
+
+    const mergedLines = [...pass1Lines];
+    for (const cand of pass2Lines) {
+      const candCy = (cand.bbox.y0 + cand.bbox.y1) / 2;
+      const candH = Math.max(8, cand.bbox.y1 - cand.bbox.y0);
+      const exists = mergedLines.some((ex) => {
+        const exCy = (ex.bbox.y0 + ex.bbox.y1) / 2;
+        if (Math.abs(candCy - exCy) >= Math.max(candH, ex.bbox.y1 - ex.bbox.y0) * 0.65) return false;
+        const overlapX = Math.max(0, Math.min(cand.bbox.x1, ex.bbox.x1) - Math.max(cand.bbox.x0, ex.bbox.x0));
+        const minW = Math.max(1, Math.min(cand.bbox.x1 - cand.bbox.x0, ex.bbox.x1 - ex.bbox.x0));
+        return overlapX / minW > 0.45;
+      });
+      if (!exists) mergedLines.push(cand);
+    }
+
+    rawOcrLines = classifyAndPairOcrLines(mergedLines, pixelData, imageWidth, imageHeight);
+    subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imageWidth, imageHeight);
+    usedEngine = 'tesseract';
+  }
+
+  const redactedImageDataUrl = await renderSanitizedImageWithSubBoxes(
+    imageDataUrl,
+    subBoxes,
+    redactionOptions
+  );
+
+  return {
+    rawOcrLines,
+    subBoxes,
+    redactedImageDataUrl,
+    engineUsed: usedEngine
+  };
 }
 
 /**

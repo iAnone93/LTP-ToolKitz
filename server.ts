@@ -101,6 +101,32 @@ async function startServer() {
     }
   });
 
+  // Server-side proxy for PaddleOCR neural models (PP-OCRv6 ONNX) with aggressive caching
+  app.get('/api/proxy-paddle-model', async (req, res) => {
+    const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    if (!rawUrl || !rawUrl.startsWith('https://huggingface.co/snowfluke/ppu-paddle-ocr-models/')) {
+      res.status(400).json({ error: 'Invalid model URL' });
+      return;
+    }
+
+    try {
+      const upstream = await fetch(rawUrl);
+      if (!upstream.ok) {
+        res.status(upstream.status).json({ error: `Upstream error ${upstream.status}` });
+        return;
+      }
+
+      const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      const arrayBuffer = await upstream.arrayBuffer();
+      res.send(Buffer.from(arrayBuffer));
+    } catch (err: any) {
+      res.status(502).json({ error: err?.message || 'Failed to proxy PaddleOCR model' });
+    }
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
