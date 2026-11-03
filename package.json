@@ -12,6 +12,7 @@
     "lint": "tsc"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
     "@tailwindcss/vite": "^4.2.0",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
@@ -50,6 +51,7 @@
   "allowScripts": {
     "esbuild": true,
     "core-js": false,
-    "tesseract.js": false
+    "tesseract.js": false,
+    "protobufjs": false
   }
 }

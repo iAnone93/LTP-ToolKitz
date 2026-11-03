@@ -9,7 +9,7 @@ import { Document as DocxDocument, Packer, Paragraph, TextRun } from "docx";
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+import '../utils/pdfjsWorker';
 
 type ConversionType = 'pdf-to-word' | 'word-to-pdf' | 'pdf-to-excel' | 'excel-to-pdf' | 'jpg-to-pdf' | 'pdf-to-jpg' | null;
 

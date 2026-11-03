@@ -28,11 +28,11 @@ export function eliminateAnomalySymbols(text: string): string {
   if (!text) return '';
 
   // 1. Normalize Latin diacritics / accented characters (e.g. 'ā' -> 'a', 'é' -> 'e', 'ü' -> 'u')
-  let cleaned = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  let cleaned = text.normalize('NFD').replace(/[̀-ͯ]/g, '');
 
   // 2. Remove all CJK ideographs (Chinese, Japanese, Korean)
   cleaned = cleaned.replace(
-    /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/g,
+    /[一-鿿㐀-䶿豈-﫿぀-ヿ가-힯]/g,
     ' '
   );
 
@@ -79,12 +79,52 @@ export function cleanOcrWords<
   return out;
 }
 
+type OcrBBox = { x0: number; y0: number; x1: number; y1: number };
+type OcrWord = { text: string; bbox: OcrBBox; confidence?: number };
+
 export interface SeparatedOcrSegment {
   text: string;
-  bbox: { x0: number; y0: number; x1: number; y1: number };
-  words: { text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }[];
+  bbox: OcrBBox;
+  words: OcrWord[];
   fieldType?: 'input_value' | 'label' | 'header_or_note';
   pairedLabel?: string;
+}
+
+// Delimiter regex:
+// - Colons ':', semicolons ';'
+// - Braces '{', '}', brackets '[', ']', chevrons '<', '>'
+// - Separator symbols '|', '\', '_', '~', '+', '=', '`'
+// - CJK ideographs (e.g. 山, 图)
+// - Geometric shapes / icons
+// - Any symbol not in standard allowed (!@#$%^&*().,-) or alphanumeric
+const DELIMITER_REGEX =
+  /([:;{}[\]|\\_~+=<>`]|[一-鿿㐀-䶿豈-﫿぀-ヿ가-힯]|[☆★□■▲▼▾▿◆◇口○●]|[^a-zA-Z0-9\s!@#$%^&*().,-]+)/g;
+
+// A URL keeps its ':' and '/' together: split there, "https" would become a label and steal the
+// value from the real key (e.g. `foto: https://...`)
+const URL_REGEX = /\bhttps?:\/\/\S+/gi;
+
+interface RawSpan {
+  cleanedText: string;
+  start: number;
+  end: number;
+  delimBefore: string;
+  delimAfter: string;
+}
+
+/** Character ranges of each OCR word inside the line text, found in reading order. */
+function locateWords(rawText: string, words: OcrWord[]) {
+  const located: { start: number; end: number; word: OcrWord }[] = [];
+  let cursor = 0;
+  for (const word of words) {
+    const t = String(word.text || '');
+    if (!t || !word.bbox) continue;
+    const at = rawText.indexOf(t, cursor);
+    if (at === -1) continue;
+    located.push({ start: at, end: at + t.length, word });
+    cursor = at + t.length;
+  }
+  return located;
 }
 
 /**
@@ -97,14 +137,14 @@ export interface SeparatedOcrSegment {
  * - 'BELUM|KAWIN' -> separated into 'BELUM' and 'KAWIN'
  * - '[LAGOA]' -> 'LAGOA'
  *
- * Each separated piece gets its own tight, accurate bounding box, word tokens, and label pairing,
- * guaranteeing that text values after (:) are NEVER connected to labels!
+ * Each piece gets a box built from the exact characters it covers (words are matched by position,
+ * and a word shared by two pieces is divided proportionally), plus its label pairing.
  */
 export function separateLineBySymbolsAndDelimiters(
   line: {
     text: string;
-    bbox: { x0: number; y0: number; x1: number; y1: number };
-    words?: { text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }[];
+    bbox: OcrBBox;
+    words?: OcrWord[];
     fieldType?: 'input_value' | 'label' | 'header_or_note';
     pairedLabel?: string;
   }
@@ -123,79 +163,53 @@ export function separateLineBySymbolsAndDelimiters(
   }
   if (!rawText) return [];
 
-  // Delimiter regex:
-  // - Colons ':', semicolons ';'
-  // - Braces '{', '}', brackets '[', ']', chevrons '<', '>'
-  // - Separator symbols '|', '\', '_', '~', '+', '=', '`'
-  // - CJK ideographs (e.g. 山, 图)
-  // - Geometric shapes / icons
-  // - Any symbol not in standard allowed (!@#$%^&*().,-) or alphanumeric
-  const delimiterRegex =
-    /([:;{}[\]|\\_~+=<>`]|[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]|[☆★□■▲▼▾▿◆◇口○●]|[^a-zA-Z0-9\s!@#$%^&*().,-]+)/g;
-
-  interface RawSpan {
-    rawSegment: string;
-    cleanedText: string;
-    start: number;
-    end: number;
-    delimBefore: string;
-    delimAfter: string;
-  }
+  const urlRanges = Array.from(rawText.matchAll(URL_REGEX), (m) => [m.index!, m.index! + m[0].length]);
+  const insideUrl = (idx: number) => urlRanges.some(([s, e]) => idx >= s && idx < e);
 
   const spans: RawSpan[] = [];
   let lastIdx = 0;
-  let lastDelim = '';
-  let match: RegExpExecArray | null;
+  // Every delimiter since the previous piece, so `nama: "Budi"` still counts as preceded by a colon
+  let pendingDelims = '';
 
-  while ((match = delimiterRegex.exec(rawText)) !== null) {
-    const matchIdx = match.index;
-    const delimStr = match[0];
-    const sliceStr = rawText.slice(lastIdx, matchIdx);
+  const pushSpan = (sliceStr: string, sliceStart: number) => {
     const trimmed = sliceStr.trim();
+    if (!trimmed) return false;
+    const cleaned = eliminateAnomalySymbols(trimmed);
+    if (!hasMeaningfulContent(cleaned)) return false;
+    const leadingSpace = sliceStr.search(/\S/);
+    const start = sliceStart + (leadingSpace >= 0 ? leadingSpace : 0);
+    spans.push({ cleanedText: cleaned, start, end: start + trimmed.length, delimBefore: pendingDelims, delimAfter: '' });
+    return true;
+  };
 
-    if (trimmed.length > 0) {
-      const cleaned = eliminateAnomalySymbols(trimmed);
-      if (hasMeaningfulContent(cleaned)) {
-        const leadingSpace = sliceStr.search(/\S/);
-        const spanStart = lastIdx + (leadingSpace >= 0 ? leadingSpace : 0);
-        const spanEnd = spanStart + trimmed.length;
-        spans.push({
-          rawSegment: trimmed,
-          cleanedText: cleaned,
-          start: spanStart,
-          end: spanEnd,
-          delimBefore: lastDelim,
-          delimAfter: delimStr
-        });
-      }
-    }
-    lastDelim = delimStr;
+  // `unit_kerja` is one identifier (a JSON key), not two words to split
+  const isSnakeCaseJoin = (m: RegExpExecArray) =>
+    m[0] === '_' && /[a-zA-Z0-9]/.test(rawText[m.index - 1] || '') && /[a-zA-Z0-9]/.test(rawText[m.index + 1] || '');
+  // A colon between digits is a time ("13T00:00:00Z", "16:53"), not a "label: value" separator
+  const isTimeSeparator = (m: RegExpExecArray) =>
+    m[0] === ':' && /\d/.test(rawText[m.index - 1] || '') && /\d/.test(rawText[m.index + 1] || '');
+
+  const delimiterRegex = new RegExp(DELIMITER_REGEX.source, 'g');
+  let match: RegExpExecArray | null;
+  while ((match = delimiterRegex.exec(rawText)) !== null) {
+    if (insideUrl(match.index) || isSnakeCaseJoin(match) || isTimeSeparator(match)) continue;
+    if (pushSpan(rawText.slice(lastIdx, match.index), lastIdx)) pendingDelims = '';
+    pendingDelims += match[0];
     lastIdx = delimiterRegex.lastIndex;
   }
+  pushSpan(rawText.slice(lastIdx), lastIdx);
+  const trailingDelims = spans.length && spans[spans.length - 1].end <= lastIdx ? pendingDelims : '';
+  spans.forEach((span, i) => {
+    span.delimAfter = i + 1 < spans.length ? spans[i + 1].delimBefore : trailingDelims;
+  });
 
-  const remainderStr = rawText.slice(lastIdx);
-  const trimmedRemainder = remainderStr.trim();
-  if (trimmedRemainder.length > 0) {
-    const cleaned = eliminateAnomalySymbols(trimmedRemainder);
-    if (hasMeaningfulContent(cleaned)) {
-      const leadingSpace = remainderStr.search(/\S/);
-      const spanStart = lastIdx + (leadingSpace >= 0 ? leadingSpace : 0);
-      const spanEnd = spanStart + trimmedRemainder.length;
-      spans.push({
-        rawSegment: trimmedRemainder,
-        cleanedText: cleaned,
-        start: spanStart,
-        end: spanEnd,
-        delimBefore: lastDelim,
-        delimAfter: ''
-      });
-    }
-  }
+  if (spans.length === 0) return [];
 
-  // If there are no delimiters or only 1 segment found
-  if (spans.length <= 1) {
+  // A single piece followed by a colon ("Nama :") is a label, even though the colon itself is dropped
+  if (spans.length === 1) {
     const cleanedFull = eliminateAnomalySymbols(rawText);
     if (!hasMeaningfulContent(cleanedFull)) return [];
+    const endsWithColon = /[:;]/.test(spans[0].delimAfter);
     return [
       {
         text: cleanedFull,
@@ -204,13 +218,13 @@ export function separateLineBySymbolsAndDelimiters(
           line.words && line.words.length > 0
             ? line.words
             : [{ text: cleanedFull, bbox: line.bbox }],
-        fieldType: line.fieldType,
+        fieldType: endsWithColon ? 'label' : line.fieldType,
         pairedLabel: line.pairedLabel
       }
     ];
   }
 
-  const rawWords = Array.isArray(line.words) ? line.words : [];
+  const located = locateWords(rawText, Array.isArray(line.words) ? line.words : []);
   const lineBBox = line.bbox || { x0: 0, y0: 0, x1: 100, y1: 20 };
   const totalLen = Math.max(1, rawText.length);
   const lineW = Math.max(1, lineBBox.x1 - lineBBox.x0);
@@ -223,8 +237,8 @@ export function separateLineBySymbolsAndDelimiters(
     let fieldType = line.fieldType;
     let pairedLabel = line.pairedLabel;
 
-    const isFollowedByColon = span.delimAfter.includes(':') || span.delimAfter.includes(';');
-    const isPrecededByColon = span.delimBefore.includes(':') || span.delimBefore.includes(';');
+    const isFollowedByColon = /[:;]/.test(span.delimAfter);
+    const isPrecededByColon = /[:;]/.test(span.delimBefore);
 
     if (isFollowedByColon) {
       fieldType = 'label';
@@ -241,59 +255,51 @@ export function separateLineBySymbolsAndDelimiters(
       }
     }
 
-    // 2. Compute accurate Bounding Box & Matching Words
-    // Look for matching words in rawWords
-    const matchingWords = rawWords.filter((w) => {
-      const wClean = eliminateAnomalySymbols(String(w.text || ''));
-      if (!wClean) return false;
-      return span.cleanedText.includes(wClean) || wClean.includes(span.cleanedText);
-    });
-
-    let segBBox: { x0: number; y0: number; x1: number; y1: number };
-
-    if (matchingWords.length > 0) {
-      // Check if a single word in rawWords contained multiple spans (e.g. 'langsung:234')
-      if (matchingWords.length === 1 && rawWords.length === 1 && spans.length > 1) {
-        const singleW = matchingWords[0];
-        const singleWWidth = Math.max(4, singleW.bbox.x1 - singleW.bbox.x0);
-        const x0 = Math.round(singleW.bbox.x0 + (span.start / totalLen) * singleWWidth);
-        const x1 = Math.round(singleW.bbox.x0 + (span.end / totalLen) * singleWWidth);
-        segBBox = {
-          x0,
-          y0: singleW.bbox.y0,
-          x1: Math.max(x0 + 4, x1),
-          y1: singleW.bbox.y1
+    // 2. Box from the exact characters of this piece
+    const parts = located
+      .filter((lw) => lw.end > span.start && lw.start < span.end)
+      .map((lw) => {
+        const from = Math.max(span.start, lw.start);
+        const to = Math.min(span.end, lw.end);
+        const len = Math.max(1, lw.end - lw.start);
+        const wb = lw.word.bbox;
+        const ww = wb.x1 - wb.x0;
+        const bbox =
+          from === lw.start && to === lw.end
+            ? wb
+            : {
+                x0: Math.round(wb.x0 + (ww * (from - lw.start)) / len),
+                y0: wb.y0,
+                x1: Math.round(wb.x0 + (ww * (to - lw.start)) / len),
+                y1: wb.y1
+              };
+        return {
+          text: eliminateAnomalySymbols(rawText.slice(from, to)),
+          bbox,
+          confidence: lw.word.confidence
         };
-      } else {
-        segBBox = {
-          x0: Math.min(...matchingWords.map((w) => w.bbox.x0)),
-          y0: Math.min(...matchingWords.map((w) => w.bbox.y0)),
-          x1: Math.max(...matchingWords.map((w) => w.bbox.x1)),
-          y1: Math.max(...matchingWords.map((w) => w.bbox.y1))
-        };
-      }
+      })
+      .filter((p) => hasMeaningfulContent(p.text));
+
+    let segBBox: OcrBBox;
+    if (parts.length > 0) {
+      segBBox = {
+        x0: Math.min(...parts.map((p) => p.bbox.x0)),
+        y0: Math.min(...parts.map((p) => p.bbox.y0)),
+        x1: Math.max(...parts.map((p) => p.bbox.x1)),
+        y1: Math.max(...parts.map((p) => p.bbox.y1))
+      };
     } else {
-      // Proportional box calculation along horizontal text line
+      // No word boxes (e.g. PaddleOCR line output): proportional box along the line
       const x0 = Math.round(lineBBox.x0 + (span.start / totalLen) * lineW);
       const x1 = Math.round(lineBBox.x0 + (span.end / totalLen) * lineW);
-      segBBox = {
-        x0,
-        y0: lineBBox.y0,
-        x1: Math.max(x0 + 4, x1),
-        y1: lineBBox.y1
-      };
+      segBBox = { x0, y0: lineBBox.y0, x1: Math.max(x0 + 4, x1), y1: lineBBox.y1 };
     }
 
     return {
       text: span.cleanedText,
       bbox: segBBox,
-      words:
-        matchingWords.length > 0
-          ? matchingWords.map((w) => ({
-              text: eliminateAnomalySymbols(w.text),
-              bbox: w.bbox
-            }))
-          : [{ text: span.cleanedText, bbox: segBBox }],
+      words: parts.length > 0 ? parts : [{ text: span.cleanedText, bbox: segBBox }],
       fieldType,
       pairedLabel
     };

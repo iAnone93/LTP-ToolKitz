@@ -1,8 +1,18 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import { PDFDocument, PDFName, PDFArray, PDFDict, rgb, StandardFonts } from 'pdf-lib';
+import {
+  PDFDocument,
+  PDFPage,
+  PDFName,
+  PDFArray,
+  PDFDict,
+  PDFRef,
+  PDFString,
+  PDFHexString,
+  rgb,
+  StandardFonts
+} from 'pdf-lib';
 
-// Ensure PDF.js worker is properly configured
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.mjs`;
+import './pdfjsWorker';
 
 export interface RedactionRule {
   id: string;
@@ -13,6 +23,8 @@ export interface RedactionRule {
   description: string;
   enabled: boolean;
   color: string;
+  /** For the `__SENSITIVE_LABELS__` rule: field labels whose values are redacted inside images */
+  labels?: string[];
 }
 
 export type OcrFieldType = 'input_value' | 'label' | 'header_or_note';
@@ -20,6 +32,16 @@ export type OcrEngineType = 'tesseract' | 'paddleocr';
 export const DEFAULT_OCR_ENGINE: OcrEngineType = 'tesseract';
 
 import { runPaddleOcrOnImage } from './paddleOcrEngine';
+import { detectFacesInImage, FaceBox } from './faceDetector';
+import {
+  analyzeOcrLayout,
+  lineConfidence,
+  resolveOcrFieldRoles,
+  DEFAULT_SENSITIVE_LABELS,
+  OcrLineLayout
+} from './ocrLayout';
+
+export { DEFAULT_SENSITIVE_LABELS };
 import {
   eliminateAnomalySymbols,
   hasMeaningfulContent,
@@ -40,7 +62,7 @@ export interface InImageSubBox {
   id: string;
   label: string;
   fullLineText?: string;
-  fieldType?: OcrFieldType;
+  fieldType?: OcrFieldType | 'face';
   pairedLabel?: string;
   ruleId?: string;
   ruleName: string;
@@ -54,11 +76,17 @@ export interface InImageSubBox {
 export interface RawOcrLineItem {
   text: string;
   bbox: { x0: number; y0: number; x1: number; y1: number };
+  /** Only from "label: value" syntax on the line itself; final roles are decided per rule set */
   fieldType?: OcrFieldType;
   pairedLabel?: string;
+  /** 0-100, when the OCR engine reports it */
+  confidence?: number;
+  /** Pixel and geometry facts measured at scan time (see analyzeOcrLayout) */
+  layout?: OcrLineLayout;
   words: {
     text: string;
     bbox: { x0: number; y0: number; x1: number; y1: number };
+    confidence?: number;
   }[];
 }
 
@@ -86,6 +114,7 @@ export interface DetectedMatch {
   imagePixelWidth?: number;
   imagePixelHeight?: number;
   rawOcrLines?: RawOcrLineItem[];
+  rawFaceBoxes?: FaceBox[];
   subBoxes?: InImageSubBox[];
   ocrEngineUsed?: OcrEngineType;
   createLocalFullSizePage?: boolean;
@@ -103,7 +132,7 @@ export const DEFAULT_REDACTION_RULES: RedactionRule[] = [
     id: 'email',
     name: 'Email Addresses',
     category: 'email',
-    pattern: '[a-zA-Z0-9_%+-]+@[a-zA-Z0-9-]+(?:[.\\s]+[a-zA-Z]{2,})?',
+    pattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+(?:[.\\s]+[a-zA-Z]{2,})?',
     flags: 'gi',
     description: 'Corporate and personal email addresses (e.g., support@corp.com)',
     enabled: true,
@@ -140,6 +169,17 @@ export const DEFAULT_REDACTION_RULES: RedactionRule[] = [
     color: 'bg-purple-500'
   },
   {
+    id: 'long_ids',
+    name: 'Long IDs & Tokens',
+    category: 'identity',
+    // 20+ letters and digits mixed, e.g. database IDs, UUID-like keys, API tokens
+    pattern: '\\b(?=[A-Za-z0-9]*\\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{20,}\\b',
+    flags: 'g',
+    description: 'Database IDs, keys and tokens: 20+ characters mixing letters and digits',
+    enabled: true,
+    color: 'bg-orange-500'
+  },
+  {
     id: 'embedded_images',
     name: 'Embedded Images / Photos',
     category: 'image',
@@ -148,6 +188,37 @@ export const DEFAULT_REDACTION_RULES: RedactionRule[] = [
     description: 'Automatically detect & blackout embedded photos, signatures, seals, and raster images',
     enabled: true,
     color: 'bg-indigo-600'
+  },
+  {
+    id: 'faces',
+    name: 'Faces in Images',
+    category: 'image',
+    pattern: '__FACES__',
+    flags: 'g',
+    description: 'Detect faces inside embedded photos & screenshots and pixelate them',
+    enabled: true,
+    color: 'bg-fuchsia-500'
+  },
+  {
+    id: 'sensitive_fields',
+    name: 'Sensitive Fields in Images',
+    category: 'image',
+    pattern: '__SENSITIVE_LABELS__',
+    flags: 'g',
+    labels: DEFAULT_SENSITIVE_LABELS,
+    description: 'Redact the value next to or under these labels (Nama, NIP, Jabatan…); labels & placeholders stay readable',
+    enabled: true,
+    color: 'bg-teal-500'
+  },
+  {
+    id: 'all_input_values',
+    name: 'All Input Values in Images (strict)',
+    category: 'image',
+    pattern: '__ALL_INPUT_VALUES__',
+    flags: 'g',
+    description: 'Also redact form values whose label is not in the sensitive list',
+    enabled: false,
+    color: 'bg-slate-500'
   },
   {
     id: 'currency',
@@ -245,9 +316,7 @@ export async function scanPdfForSensitiveData(
   const activeTextRules = activeRules.filter(
     r => r.category !== 'image' && r.pattern !== '__EMBEDDED_IMAGES__'
   );
-  const activeImageRule = activeRules.find(
-    r => r.category === 'image' || r.pattern === '__EMBEDDED_IMAGES__'
-  );
+  const activeImageRule = activeRules.find(r => r.pattern === '__EMBEDDED_IMAGES__');
 
   for (let pageIdx = 0; pageIdx < numPages; pageIdx++) {
     if (onProgress) {
@@ -720,6 +789,40 @@ export async function scanPdfForSensitiveData(
   return { matches: detectedMatches, numPages };
 }
 
+// Blocks across the longer side of a censored face. Fewer blocks = less recoverable; ~7 leaves only colour patches.
+const FACE_PIXEL_BLOCKS = 7;
+
+function pixelateRegion(ctx: CanvasRenderingContext2D, rx: number, ry: number, rw: number, rh: number) {
+  // Whole pixels: fractional edges would be anti-aliased with the original face pixels
+  const x = Math.max(0, Math.floor(rx));
+  const y = Math.max(0, Math.floor(ry));
+  const w = Math.min(ctx.canvas.width - x, Math.ceil(rx + rw) - x);
+  const h = Math.min(ctx.canvas.height - y, Math.ceil(ry + rh) - y);
+  if (w <= 0 || h <= 0) return;
+
+  const cell = Math.max(4, Math.ceil(Math.max(w, h) / FACE_PIXEL_BLOCKS));
+  const smallW = Math.max(1, Math.round(w / cell));
+  const smallH = Math.max(1, Math.round(h / cell));
+
+  const small = document.createElement('canvas');
+  small.width = smallW;
+  small.height = smallH;
+  const smallCtx = small.getContext('2d');
+  if (!smallCtx) {
+    ctx.fillStyle = '#0d0d0d';
+    ctx.fillRect(x, y, w, h);
+    return;
+  }
+  smallCtx.imageSmoothingEnabled = true;
+  smallCtx.imageSmoothingQuality = 'high';
+  smallCtx.drawImage(ctx.canvas, x, y, w, h, 0, 0, smallW, smallH);
+
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(small, 0, 0, smallW, smallH, x, y, w, h);
+  ctx.restore();
+}
+
 /**
  * Render an original image DataURL together with its active InImageSubBox redactions
  * into a composited DataURL (used for live thumbnail preview, modal preview, and PDF export).
@@ -746,14 +849,19 @@ export async function renderSanitizedImageWithSubBoxes(
 
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-      const activeSubBoxes = (subBoxes || []).filter(b => b.selected);
+      // Faces first, so they are pixelated from the original pixels rather than from other boxes drawn on top
+      const activeSubBoxes = (subBoxes || [])
+        .filter(b => b.selected)
+        .sort((a, b) => Number(b.fieldType === 'face') - Number(a.fieldType === 'face'));
       for (const box of activeSubBoxes) {
         const bx = box.xRatio * canvas.width;
         const by = box.yRatio * canvas.height;
         const bw = Math.max(8, box.wRatio * canvas.width);
         const bh = Math.max(8, box.hRatio * canvas.height);
 
-        if (options.mode === 'blackout') {
+        if (box.fieldType === 'face') {
+          pixelateRegion(ctx, bx, by, bw, bh);
+        } else if (options.mode === 'blackout') {
           ctx.fillStyle = '#0d0d0d';
           ctx.fillRect(bx, by, bw, bh);
         } else if (options.mode === 'whiteout') {
@@ -861,14 +969,16 @@ async function extractNativePdfImageObject(
 
       const timer = setTimeout(() => finish(null), 400);
       try {
-        if (typeof page.objs?.get === 'function') {
-          page.objs.get(imageObjId, (data: any) => {
+        // PDF.js keeps images shared across pages in `commonObjs` (ids prefixed `g_`), the rest in `objs`
+        const store = imageObjId.startsWith('g_') ? page.commonObjs : page.objs;
+        if (store?.has?.(imageObjId)) {
+          clearTimeout(timer);
+          finish(store.get(imageObjId));
+        } else if (typeof store?.get === 'function') {
+          store.get(imageObjId, (data: any) => {
             clearTimeout(timer);
             finish(data);
           });
-        } else if (page.commonObjs?.has?.(imageObjId)) {
-          clearTimeout(timer);
-          finish(page.commonObjs.get(imageObjId));
         } else {
           clearTimeout(timer);
           finish(null);
@@ -1088,21 +1198,9 @@ async function extractRawUncroppedImagesFromPdfPage(
       return streams;
     };
 
+    // Only this page's own resources: scanning the whole document could pair an image with one from another page
     const pageResources = page.node.lookupMaybe(PDFName.of('Resources'), PDFDict);
-    let imageStreams = collectXObjectsFromResources(pageResources);
-
-    // Only scan global indirect objects when the entire PDF has <= 4 pages (prevents decoding all 225 images on every page of a huge PDF!)
-    if (imageStreams.length === 0 && pages.length <= 4) {
-      for (const [, obj] of pdfLibDoc.context.enumerateIndirectObjects()) {
-        const rawObj = obj as any;
-        if (rawObj?.dict instanceof PDFDict) {
-          const subtype = rawObj.dict.lookup(PDFName.of('Subtype'))?.toString?.();
-          if (subtype === '/Image') {
-            imageStreams.push(rawObj);
-          }
-        }
-      }
-    }
+    const imageStreams = collectXObjectsFromResources(pageResources);
 
     for (const rawStream of imageStreams) {
       try {
@@ -1463,275 +1561,21 @@ async function prepareImageForHighSensitivityOcr(
 
 
 
-export const isKnownFormLabelRegex =
-  /^(id\s+pipeline|sektor\s+ekonomi|sub\s+sektor|jenis\s+usaha|status\s+perkawinan|status\s+tempat|alamat\s+identitas|alamat|kelurahan|kecamatan|kode\s+pos|kode\s+pekerjaan|kode\s+status|pendidikan|gelar|nama\s+nasabah|nama\s+aom|nip\s+aom|tempat\s+lahir|tanggal\s+lahir|jenis\s+kelamin|lama\s+usaha|rencana\s+plafon|no\.?\s*telepon|no\.?\s*hp|telepon|email|keterangan|nomor|nik|npwp|label|field)\b/i;
-
-export const isHeaderOrBannerRegex =
-  /\b(form\s+data|form\s+uji|uji\s+kelayakan|detail\s+informasi|daftar\s+prospek|save\s+draft|back|home|inisiasi|baru\s*-\s*baru|pilih\s+awal|pilih\s+akhir|pilih\s+periode|network\s+elements|keep\s+log|disable|enable)\b/i;
-
-export function isFormLabelCandidate(str: string): boolean {
-  const trimmed = str.trim();
-  if (isHeaderOrBannerRegex.test(trimmed)) return false;
-  return (
-    /:\s*$/.test(trimmed) ||
-    /\(\s*\*\s*\)/.test(trimmed) ||
-    isKnownFormLabelRegex.test(trimmed)
-  );
-}
-
 /**
- * Inspect the original image's pixels and text syntax to classify each OCR line as:
- * - `'input_value'`: Text inside a bordered form input box or dropdown (`LAGOA`, `14270`, `Buruh`, `1997-08-04`, `Test5`, `BELUM KAWIN`)
- * - `'label'`: Form field label sitting above an input box (`Kelurahan (*)`, `Kode Pos (*)`, `Status Perkawinan (*)`)
- * - `'header_or_note'`: Top app bar, blue banner card (`Form Uji Kelayakan`, `Caraka`, `Baru - baru lima`), button (`Save Draft`), or helper note (`* Usia maximum...`)
- */
-function classifyAndPairOcrLines(
-  lines: RawOcrLineItem[],
-  pixelData: Uint8ClampedArray | null,
-  imgW: number,
-  imgH: number
-): RawOcrLineItem[] {
-  if (lines.length === 0) return lines;
-
-  // Step 2 & 3: Eliminate Anomaly Symbols across all incoming lines AND
-  // separate text wherever an anomaly symbol or colon/semicolon/delimiter was positioned
-  // (e.g. 'auto山 detect' -> 'auto' and 'detect'; 'langsung: {id: 234' -> 'langsung', 'id', and '234')
-  const sanitizedLines: RawOcrLineItem[] = [];
-  for (const line of lines) {
-    const pieces = separateLineBySymbolsAndDelimiters(line);
-    for (const piece of pieces) {
-      if (hasMeaningfulContent(piece.text)) {
-        sanitizedLines.push(piece);
-      }
-    }
-  }
-
-  if (sanitizedLines.length === 0) return [];
-
-  // Sort lines top-to-bottom by vertical center
-  const sorted = [...sanitizedLines].sort(
-    (a, b) => (a.bbox.y0 + a.bbox.y1) / 2 - (b.bbox.y0 + b.bbox.y1) / 2
-  );
-
-  // Inspect background color & surrounding input-box borders in the original image
-  const inspectBoxEnvironment = (bbox: { x0: number; y0: number; x1: number; y1: number }) => {
-    if (!pixelData || imgW < 32 || imgH < 32) {
-      return { isWhiteInputBox: false, isColoredBannerBg: false };
-    }
-
-    const x0 = Math.max(0, Math.floor(bbox.x0));
-    const y0 = Math.max(0, Math.floor(bbox.y0));
-    const x1 = Math.min(imgW - 1, Math.ceil(bbox.x1));
-    const y1 = Math.min(imgH - 1, Math.ceil(bbox.y1));
-
-    const getRgb = (x: number, y: number) => {
-      const idx = (Math.min(imgH - 1, Math.max(0, y)) * imgW + Math.min(imgW - 1, Math.max(0, x))) * 4;
-      const r = pixelData[idx];
-      const g = pixelData[idx + 1];
-      const b = pixelData[idx + 2];
-      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-      return { r, g, b, lum };
-    };
-
-    // 1. Sample background pixels around and inside the text bounding box to detect colored/blue banners vs white/light form surfaces
-    let coloredBgSamples = 0;
-    let lightNeutralBgSamples = 0;
-    let totalBgSamples = 0;
-
-    const sampleYTop = Math.max(0, y0 - 3);
-    const sampleYBot = Math.min(imgH - 1, y1 + 3);
-    const stepX = Math.max(2, Math.floor((x1 - x0) / 8));
-
-    for (let sx = x0; sx <= x1; sx += stepX) {
-      for (const sy of [sampleYTop, sampleYBot]) {
-        const { r, g, b, lum } = getRgb(sx, sy);
-        totalBgSamples++;
-        const maxC = Math.max(r, g, b);
-        const minC = Math.min(r, g, b);
-        const saturation = maxC - minC;
-
-        // Blue/colored banner or dark app bar: high color saturation (e.g. blue > red + 35) or dark background
-        if ((b - r > 35 && lum < 210) || saturation > 45 || lum < 115) {
-          coloredBgSamples++;
-        } else if (lum >= 215 && saturation <= 30) {
-          lightNeutralBgSamples++;
-        }
-      }
-    }
-
-    const isColoredBannerBg = totalBgSamples > 0 && coloredBgSamples / totalBgSamples >= 0.35;
-    if (isColoredBannerBg) {
-      return { isWhiteInputBox: false, isColoredBannerBg: true };
-    }
-
-    // 2. Check if this text sits on a bright white input surface (`lum >= 232`) enclosed by a dark horizontal top border AND bottom border
-    const cx = Math.min(imgW - 1, Math.max(0, Math.round((x0 + x1) / 2)));
-    const sampleX2 = Math.min(imgW - 1, Math.max(0, Math.round(x0 + (x1 - x0) * 0.25)));
-    const maxSearchDist = Math.max(42, Math.round(imgH * 0.075));
-
-    let foundTopBorder = false;
-    let topBorderY = y0;
-    for (let y = Math.max(0, y0 - 2); y >= Math.max(0, y0 - maxSearchDist); y--) {
-      if (getRgb(cx, y).lum < 165 || getRgb(sampleX2, y).lum < 165) {
-        let horizDarkCount = 0;
-        for (let dx = -18; dx <= 18; dx += 3) {
-          const sx = Math.min(imgW - 1, Math.max(0, cx + dx));
-          if (getRgb(sx, y).lum < 175) horizDarkCount++;
-        }
-        if (horizDarkCount >= 9) {
-          foundTopBorder = true;
-          topBorderY = y;
-          break;
-        }
-      }
-    }
-
-    let foundBottomBorder = false;
-    let bottomBorderY = y1;
-    for (let y = Math.min(imgH - 1, y1 + 2); y <= Math.min(imgH - 1, y1 + maxSearchDist); y++) {
-      if (getRgb(cx, y).lum < 165 || getRgb(sampleX2, y).lum < 165) {
-        let horizDarkCount = 0;
-        for (let dx = -18; dx <= 18; dx += 3) {
-          const sx = Math.min(imgW - 1, Math.max(0, cx + dx));
-          if (getRgb(sx, y).lum < 175) horizDarkCount++;
-        }
-        if (horizDarkCount >= 9) {
-          foundBottomBorder = true;
-          bottomBorderY = y;
-          break;
-        }
-      }
-    }
-
-    const boxHeight = bottomBorderY - topBorderY;
-    const isPlausibleInputHeight = boxHeight >= 18 && boxHeight <= Math.max(110, imgH * 0.14);
-    const isWhiteInputBox =
-      foundTopBorder &&
-      foundBottomBorder &&
-      isPlausibleInputHeight &&
-      totalBgSamples > 0 &&
-      lightNeutralBgSamples / totalBgSamples >= 0.4;
-
-    return { isWhiteInputBox, isColoredBannerBg: false };
-  };
-
-  const isHelperNoteRegex = /^\*|\b(wajib|maximum|maksimum|sesuai dengan|apakah)\b/i;
-  const isStatusBarRegex = /\b\d{1,2}:\d{2}\b.*%|\b(4g|5g|lte|wifi)\b/i;
-
-  for (const item of sorted) {
-    const t = item.text.trim();
-    const { isWhiteInputBox, isColoredBannerBg } = inspectBoxEnvironment(item.bbox);
-
-    if (
-      isColoredBannerBg ||
-      isStatusBarRegex.test(t) ||
-      isHeaderOrBannerRegex.test(t) ||
-      isHelperNoteRegex.test(t)
-    ) {
-      item.fieldType = 'header_or_note';
-    } else if (item.fieldType === 'label' || isFormLabelCandidate(t)) {
-      item.fieldType = 'label';
-    } else if (item.fieldType === 'input_value' || item.pairedLabel || isWhiteInputBox) {
-      item.fieldType = 'input_value';
-    } else {
-      item.fieldType = 'header_or_note';
-    }
-  }
-
-  // Second pass:
-  // 2A. Horizontal Same-Row Pairing (Key-Value summary cards where left column = Label and right column = Value)
-  // 2B. Vertical Stacked Pairing (Form inputs where top line = Label and box below = Input Value)
-  for (let i = 0; i < sorted.length; i++) {
-    const curr = sorted[i];
-    if (curr.fieldType === 'label') {
-      const cleanLabelName = curr.text.replace(/\(\s*\*\s*\)/g, '').replace(/:\s*$/, '').trim();
-      const currCy = (curr.bbox.y0 + curr.bbox.y1) / 2;
-      const currH = Math.max(8, curr.bbox.y1 - curr.bbox.y0);
-
-      // 2A. Check if there is a right-column value on the SAME horizontal row (separated by space)
-      let foundHorizontalValue = false;
-      for (let j = 0; j < sorted.length; j++) {
-        if (i === j) continue;
-        const other = sorted[j];
-        const otherCy = (other.bbox.y0 + other.bbox.y1) / 2;
-        const otherH = Math.max(8, other.bbox.y1 - other.bbox.y0);
-        const sameRow = Math.abs(currCy - otherCy) <= Math.max(currH, otherH) * 0.75;
-        const isToTheRight = other.bbox.x0 >= curr.bbox.x1 - 4;
-
-        if (sameRow && isToTheRight && other.fieldType !== 'label') {
-          const { isColoredBannerBg } = inspectBoxEnvironment(other.bbox);
-          if (!isColoredBannerBg && !isHeaderOrBannerRegex.test(other.text)) {
-            other.fieldType = 'input_value';
-            other.pairedLabel = cleanLabelName;
-            foundHorizontalValue = true;
-
-            // Also check if a multi-line right-column value wraps onto the very next line (e.g. "BISA DITEMUI DAN" / "LAYAK")
-            for (let k = 0; k < sorted.length; k++) {
-              if (k === i || k === j) continue;
-              const wrapped = sorted[k];
-              if (wrapped.fieldType === 'label' || wrapped.pairedLabel) continue;
-              const vGap = wrapped.bbox.y0 - other.bbox.y1;
-              const rightAligned =
-                wrapped.bbox.x0 > imgW * 0.42 ||
-                Math.abs(wrapped.bbox.x1 - other.bbox.x1) <= imgW * 0.08;
-              if (vGap >= -4 && vGap <= otherH * 1.45 && rightAligned) {
-                const { isColoredBannerBg: wrapBanner } = inspectBoxEnvironment(wrapped.bbox);
-                if (!wrapBanner && !isKnownFormLabelRegex.test(wrapped.text)) {
-                  wrapped.fieldType = 'input_value';
-                  wrapped.pairedLabel = cleanLabelName;
-                }
-              }
-            }
-          }
-        }
-      }
-
-      if (foundHorizontalValue) continue;
-
-      // 2B. Otherwise, look for a stacked input box immediately BELOW this label
-      for (let j = i + 1; j < sorted.length; j++) {
-        const below = sorted[j];
-        const vertGap = below.bbox.y0 - curr.bbox.y1;
-        if (vertGap < -6) continue; // same horizontal row
-        if (vertGap > imgH * 0.12) break; // too far below
-        if (below.fieldType === 'label') break; // hit the next form label
-
-        const { isColoredBannerBg } = inspectBoxEnvironment(below.bbox);
-        if (!isColoredBannerBg && !isHelperNoteRegex.test(below.text) && !isHeaderOrBannerRegex.test(below.text)) {
-          below.fieldType = 'input_value';
-          below.pairedLabel = cleanLabelName;
-        }
-        break;
-      }
-    } else if (curr.fieldType === 'input_value' && !curr.pairedLabel) {
-      // Look upward for the nearest label above this enclosed input box
-      for (let j = i - 1; j >= 0; j--) {
-        const above = sorted[j];
-        const vertGap = curr.bbox.y0 - above.bbox.y1;
-        if (vertGap > imgH * 0.14) break;
-        if (above.fieldType === 'label') {
-          curr.pairedLabel = above.text.replace(/\(\s*\*\s*\)/g, '').replace(/:\s*$/, '').trim();
-          break;
-        }
-      }
-    }
-  }
-
-  return sorted;
-}
-
-/**
- * Evaluate raw OCR lines against the user's active Regex & Detection Rules AND Form Input Value detection.
- * - Automatically redacts detected Form Input Values (`fieldType === 'input_value'`) once the scan is complete!
- * - Also redacts any exact substring matching the user's active Regex Rules (while skipping single-character noise).
- * - Keeps Form Labels (`label`) and Headers/Banners (`header_or_note`) readable (`selected: false`) unless explicitly matched by a clean multi-character regex.
+ * Decide which OCR lines inside an image are redacted under the current rules:
+ * - Regex rule matches (NIK, phone, email…) are always redacted.
+ * - Values paired with a sensitive field label (Nama, NIP, Jabatan…) are redacted.
+ * - Other input values are suggested (unticked), unless the strict "All Input Values" rule is on.
+ * - Labels, titles, placeholders and UI text stay readable.
+ * Faces and the user's own drawn boxes are carried over.
  */
 export function evaluateOcrLinesAgainstRules(
   rawOcrLines: RawOcrLineItem[],
   rules: RedactionRule[],
   imgW: number,
   imgH: number,
-  existingSubBoxes?: InImageSubBox[]
+  existingSubBoxes?: InImageSubBox[],
+  rawFaceBoxes?: FaceBox[]
 ): InImageSubBox[] {
   const activeTextRules = rules.filter(
     r =>
@@ -1746,25 +1590,83 @@ export function evaluateOcrLinesAgainstRules(
   const subBoxes: InImageSubBox[] = [...customBoxes];
   let subIdx = 0;
 
-  // Pipeline Step 2: Ensure any raw OCR lines with colons or anomaly symbols are strictly separated
-  const normalizedOcrLines: RawOcrLineItem[] = [];
-  for (const line of rawOcrLines) {
-    const pieces = separateLineBySymbolsAndDelimiters(line);
-    for (const piece of pieces) {
-      if (hasMeaningfulContent(piece.text)) {
-        normalizedOcrLines.push(piece);
-      }
-    }
-  }
+  const facesEnabled = rules.some(r => r.enabled && r.pattern === '__FACES__');
+  const faceBoxes = facesEnabled ? rawFaceBoxes || [] : [];
+  faceBoxes.forEach((face, i) => {
+    const id = `face-${i}`;
+    const previous = existingSubBoxes?.find(b => b.id === id);
+    subBoxes.push({
+      id,
+      label: `Face #${i + 1}`,
+      fieldType: 'face',
+      ruleId: 'faces',
+      ruleName: `Face (Pixelated) • ${Math.round(face.score * 100)}% confidence`,
+      xRatio: face.xRatio,
+      yRatio: face.yRatio,
+      wRatio: face.wRatio,
+      hRatio: face.hRatio,
+      selected: previous ? previous.selected : true
+    });
+  });
 
-  for (const line of normalizedOcrLines) {
+  const sensitiveRule = rules.find(r => r.enabled && r.pattern === '__SENSITIVE_LABELS__');
+  const sensitiveLabels = sensitiveRule ? sensitiveRule.labels ?? DEFAULT_SENSITIVE_LABELS : [];
+  const strictInputs = rules.some(r => r.enabled && r.pattern === '__ALL_INPUT_VALUES__');
+  // Lines were split and cleaned at scan time; layout indexes refer to this exact array
+  const roles = resolveOcrFieldRoles(rawOcrLines, sensitiveLabels);
+  const valueGroupOf = new Map<string, number>();
+
+  for (let lineIdx = 0; lineIdx < rawOcrLines.length; lineIdx++) {
+    const line = rawOcrLines[lineIdx];
     const lineText = String(line.text || '').trim();
     if (!lineText || lineText.length < 2) continue;
     const bbox = line.bbox;
     if (!bbox) continue;
 
-    const fieldType: OcrFieldType = line.fieldType || 'header_or_note';
-    const pairedLabel = line.pairedLabel;
+    const { role, pairedLabel, sensitive, inlineValueFromWord } = roles[lineIdx];
+    const fieldType: OcrFieldType =
+      role === 'value' ? 'input_value' : role === 'label' ? 'label' : 'header_or_note';
+
+    // Key and value read as one line: readable key, redacted value
+    if (inlineValueFromWord !== undefined && line.words.length > inlineValueFromWord) {
+      const keyWords = line.words.slice(0, inlineValueFromWord);
+      const valueWords = line.words.slice(inlineValueFromWord);
+      const toRatios = (b: { x0: number; y0: number; x1: number; y1: number }) => ({
+        xRatio: b.x0 / imgW,
+        yRatio: b.y0 / imgH,
+        wRatio: (b.x1 - b.x0) / imgW,
+        hRatio: (b.y1 - b.y0) / imgH
+      });
+      const keyText = keyWords.map(w => w.text).join(' ');
+      const valueText = eliminateAnomalySymbols(valueWords.map(w => w.text).join(' '));
+      subBoxes.push({
+        id: `ocr-line-${subIdx++}`,
+        label: eliminateAnomalySymbols(keyText),
+        fullLineText: lineText,
+        fieldType: 'label',
+        ruleName: 'Form Label (Readable)',
+        ...toRatios(computeFullCoverageBox(bbox, keyWords, imgW, imgH)),
+        selected: false
+      });
+      const valueBox = {
+        x0: Math.min(...valueWords.map(w => w.bbox.x0)),
+        y0: Math.min(...valueWords.map(w => w.bbox.y0)),
+        x1: Math.max(...valueWords.map(w => w.bbox.x1), line.layout?.inkBox?.x1 ?? 0),
+        y1: Math.max(...valueWords.map(w => w.bbox.y1))
+      };
+      subBoxes.push({
+        id: `ocr-input-${subIdx++}`,
+        label: valueText,
+        fullLineText: lineText,
+        fieldType: 'input_value',
+        pairedLabel,
+        ruleId: 'sensitive_fields',
+        ruleName: `Sensitive Field • ${pairedLabel}`,
+        ...toRatios(computeFullCoverageBox(valueBox, undefined, imgW, imgH)),
+        selected: sensitive
+      });
+      continue;
+    }
 
     // Locate word character spans within `lineText` so we can tightly bound regex sub-matches
     const wordSpans: {
@@ -1846,28 +1748,38 @@ export function evaluateOcrLinesAgainstRules(
       }
     }
 
-    // Check if this line is a Form Input Value (`input_value`) -> Automatically redact the full input value!
+    // A form value: redacted when its label is sensitive (or a rule matches), otherwise only suggested
     if (fieldType === 'input_value') {
-      const { x0, y0, x1, y1 } = computeFullCoverageBox(bbox, line.words, imgW, imgH);
+      // Sized to the measured ink, so letters OCR missed at either end are covered too
+      const inkBox = line.layout?.inkBox;
+      const { x0, y0, x1, y1 } = computeFullCoverageBox(inkBox ?? bbox, inkBox ? undefined : line.words, imgW, imgH);
       if (x1 > x0 && y1 > y0) {
         const matchedRuleInfo = lineMatches[0];
+        const autoRedact = sensitive || Boolean(matchedRuleInfo) || strictInputs;
+        if (roles[lineIdx].group !== undefined) valueGroupOf.set(`ocr-input-${subIdx}`, roles[lineIdx].group!);
         subBoxes.push({
           id: `ocr-input-${subIdx++}`,
           label: lineText,
           fullLineText: lineText,
           fieldType: 'input_value',
           pairedLabel,
-          ruleId: matchedRuleInfo ? matchedRuleInfo.ruleId : 'form_input_value',
+          ruleId: matchedRuleInfo
+            ? matchedRuleInfo.ruleId
+            : sensitive
+            ? 'sensitive_fields'
+            : 'form_input_value',
           ruleName: matchedRuleInfo
             ? `${matchedRuleInfo.ruleName}${pairedLabel ? ` • ${pairedLabel}` : ''}`
+            : sensitive
+            ? `Sensitive Field • ${pairedLabel}`
             : pairedLabel
-            ? `Input Value (${pairedLabel})`
-            : 'Form Input Value (Auto-Redacted)',
+            ? `Input Value (${pairedLabel}) • not in sensitive list`
+            : 'Input Value (no label found)',
           xRatio: x0 / imgW,
           yRatio: y0 / imgH,
           wRatio: (x1 - x0) / imgW,
           hRatio: (y1 - y0) / imgH,
-          selected: true
+          selected: autoRedact
         });
       }
     } else if (lineMatches.length > 0) {
@@ -1920,13 +1832,15 @@ export function evaluateOcrLinesAgainstRules(
         }
       }
     } else {
-      // Unmatched Form Label or Header/Note: keep `selected: false` (Readable) so labels & titles stay clear!
+      // Labels, titles, placeholders and other text stay readable (`selected: false`)
       const { x0, y0, x1, y1 } = computeFullCoverageBox(bbox, line.words, imgW, imgH);
       if (x1 > x0 && y1 > y0) {
         const typeDesc =
-          fieldType === 'label'
+          role === 'label'
             ? 'Form Label (Readable)'
-            : 'Header / Banner (Readable)';
+            : role === 'placeholder'
+            ? 'Placeholder (Readable)'
+            : 'Text (Readable)';
 
         subBoxes.push({
           id: `ocr-line-${subIdx++}`,
@@ -1945,13 +1859,48 @@ export function evaluateOcrLinesAgainstRules(
     }
   }
 
-  return subBoxes;
+  return mergeValuePiecesPerRow(subBoxes, valueGroupOf);
+}
+
+/**
+ * Pieces of one value on the same row become one box, covering the gaps between them too
+ * (justified text and " - " separators leave readable slivers between separate boxes).
+ */
+function mergeValuePiecesPerRow(boxes: InImageSubBox[], groupOf: Map<string, number>): InImageSubBox[] {
+  const out: InImageSubBox[] = [];
+  const sameRow = (a: InImageSubBox, b: InImageSubBox) => {
+    const overlap = Math.min(a.yRatio + a.hRatio, b.yRatio + b.hRatio) - Math.max(a.yRatio, b.yRatio);
+    return overlap >= Math.min(a.hRatio, b.hRatio) * 0.5;
+  };
+  for (const box of boxes) {
+    const group = groupOf.get(box.id);
+    const target =
+      group === undefined
+        ? undefined
+        : out.find(o => groupOf.get(o.id) === group && o.selected === box.selected && sameRow(o, box));
+    if (!target) {
+      out.push(box);
+      continue;
+    }
+    const x0 = Math.min(target.xRatio, box.xRatio);
+    const y0 = Math.min(target.yRatio, box.yRatio);
+    const x1 = Math.max(target.xRatio + target.wRatio, box.xRatio + box.wRatio);
+    const y1 = Math.max(target.yRatio + target.hRatio, box.yRatio + box.hRatio);
+    Object.assign(target, {
+      label: box.xRatio >= target.xRatio ? `${target.label} ${box.label}` : `${box.label} ${target.label}`,
+      xRatio: x0,
+      yRatio: y0,
+      wRatio: x1 - x0,
+      hRatio: y1 - y0
+    });
+  }
+  return out;
 }
 
 // Helper to extract normalized line items from a Tesseract recognize() response,
 // automatically splitting lines whenever there is a large horizontal space gap between words
 // (e.g., two-column "Label ............ Value" rows or "Header ........ Icon")!
-function extractLinesFromOcrData(ocrData: any, imageWidth: number): RawOcrLineItem[] {
+function extractLinesFromOcrData(ocrData: any): RawOcrLineItem[] {
   const out: RawOcrLineItem[] = [];
   const extractedLines: any[] = [];
   const extractedWords: any[] = [];
@@ -1992,6 +1941,11 @@ function extractLinesFromOcrData(ocrData: any, imageWidth: number): RawOcrLineIt
         words: rawWords
       });
 
+      // A label split into columns ("$Y auth   nip:") keeps only the column touching the colon;
+      // values on this line that point to the whole text must point to that column instead
+      const lineStart = out.length;
+      const relabelled = new Map<string, string>();
+
       for (const piece of pieces) {
         if (
           !hasMeaningfulContent(piece.text) ||
@@ -2000,11 +1954,12 @@ function extractLinesFromOcrData(ocrData: any, imageWidth: number): RawOcrLineIt
           continue;
         }
 
-        // If piece has multiple words, check if there's an unusually large horizontal gap (e.g. multi-column layout)
+        // If piece has multiple words, check if there's an unusually large horizontal gap (e.g. multi-column layout).
+        // Word spacing is well under one text height, so a gap of ~2 heights means a new column
         const pWords = piece.words || [];
         if (pWords.length >= 2) {
-          const lineH = Math.max(10, ...pWords.map((w: any) => Math.max(8, w.bbox.y1 - w.bbox.y0)));
-          const splitGapThreshold = Math.max(25, lineH * 1.8, imageWidth * 0.065);
+          const lineH = Math.max(8, ...pWords.map((w: any) => Math.max(6, w.bbox.y1 - w.bbox.y0)));
+          const splitGapThreshold = Math.max(16, lineH * 2.2);
 
           const segments: (typeof pWords)[] = [];
           let currentSeg: typeof pWords = [pWords[0]];
@@ -2024,32 +1979,42 @@ function extractLinesFromOcrData(ocrData: any, imageWidth: number): RawOcrLineIt
           segments.push(currentSeg);
 
           if (segments.length > 1) {
-            for (let sIdx = 0; sIdx < segments.length; sIdx++) {
-              const seg = segments[sIdx];
-              const segText = eliminateAnomalySymbols(seg.map((w: any) => w.text).join(' '));
-              if (!hasMeaningfulContent(segText) || (segText.length === 1 && !/\d/.test(segText)))
-                continue;
+            const kept = segments
+              .map(seg => ({ seg, segText: eliminateAnomalySymbols(seg.map((w: any) => w.text).join(' ')) }))
+              .filter(({ segText }) => hasMeaningfulContent(segText) && !(segText.length === 1 && !/\d/.test(segText)));
 
+            if (piece.fieldType === 'label' && kept.length > 0) {
+              relabelled.set(piece.text, kept[kept.length - 1].segText);
+            }
+            kept.forEach(({ seg, segText }, kIdx) => {
               const segBBox = {
                 x0: Math.min(...seg.map((w: any) => w.bbox.x0)),
                 y0: Math.min(...seg.map((w: any) => w.bbox.y0)),
                 x1: Math.max(...seg.map((w: any) => w.bbox.x1)),
                 y1: Math.max(...seg.map((w: any) => w.bbox.y1))
               };
-
+              // The "label: value" syntax belongs to the column touching the colon: the last column
+              // for a label ("LE Mulyono   NIP:" -> "NIP"), the first for a value. The other columns
+              // are independent text, paired later by position.
+              const ownsSyntax = piece.fieldType === 'label' ? kIdx === kept.length - 1 : kIdx === 0;
               out.push({
                 text: segText,
                 bbox: segBBox,
                 words: seg,
-                fieldType: sIdx === 0 ? piece.fieldType : 'input_value',
-                pairedLabel: sIdx === 0 ? piece.pairedLabel : piece.text
+                fieldType: ownsSyntax ? piece.fieldType : undefined,
+                pairedLabel: ownsSyntax ? piece.pairedLabel : undefined
               });
-            }
+            });
             continue;
           }
         }
 
         out.push(piece);
+      }
+
+      for (let k = lineStart; k < out.length; k++) {
+        const renamed = out[k].pairedLabel && relabelled.get(out[k].pairedLabel!);
+        if (renamed) out[k].pairedLabel = renamed;
       }
     }
   } else if (extractedWords.length > 0) {
@@ -2088,6 +2053,243 @@ function extractLinesFromOcrData(ocrData: any, imageWidth: number): RawOcrLineIt
  * and run PaddleOCR (ONNX) or Tesseract OCR to create selective in-image redaction subBoxes
  * strictly matching the user's active Regex & Detection Rules!
  */
+/** Face detection is an extra layer on top of OCR, so a failure (e.g. WASM blocked) must not stop the scan */
+async function detectFacesSafely(dataUrl: string): Promise<FaceBox[]> {
+  try {
+    return await detectFacesInImage(dataUrl);
+  } catch (err) {
+    console.warn('Face detection unavailable for this image:', err);
+    return [];
+  }
+}
+
+// Tesseract reads reliably from ~20px tall text; desktop UI screenshots are often ~10px,
+// which turns "Jabatan :" into "Jabotan" and drops colons. Such images are re-read upscaled.
+const OCR_MIN_TEXT_HEIGHT = 18;
+const OCR_MAX_UPSCALED_SIDE = 4000;
+
+type OcrBox = { x0: number; y0: number; x1: number; y1: number };
+
+function scaleOcrBox(b: OcrBox, factor: number): OcrBox {
+  return { x0: b.x0 * factor, y0: b.y0 * factor, x1: b.x1 * factor, y1: b.y1 * factor };
+}
+
+function scaleOcrLines(lines: RawOcrLineItem[], factor: number): RawOcrLineItem[] {
+  if (factor === 1) return lines;
+  return lines.map(l => ({
+    ...l,
+    bbox: scaleOcrBox(l.bbox, factor),
+    words: (l.words || []).map(w => ({ ...w, bbox: scaleOcrBox(w.bbox, factor) }))
+  }));
+}
+
+function medianWordHeight(lines: RawOcrLineItem[]): number | null {
+  const heights = lines
+    .flatMap(l => l.words || [])
+    .map(w => w.bbox.y1 - w.bbox.y0)
+    .filter(h => h > 0)
+    .sort((a, b) => a - b);
+  return heights.length ? heights[Math.floor(heights.length / 2)] : null;
+}
+
+function upscaleImage(dataUrl: string, w: number, h: number, scale: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(w * scale);
+      canvas.height = Math.round(h * scale);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        reject(new Error('Canvas 2D context unavailable for OCR upscaling'));
+        return;
+      }
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/png'));
+    };
+    img.onerror = () => reject(new Error('Could not load image for OCR upscaling'));
+    img.src = dataUrl;
+  });
+}
+
+function rebuildLineFromWords(line: RawOcrLineItem, words: RawOcrLineItem['words']): RawOcrLineItem {
+  const all = line.words || [];
+  // The colon role stays only if the word next to the colon survived
+  const keepsSyntax =
+    line.fieldType === 'label'
+      ? words.includes(all[all.length - 1])
+      : line.fieldType === 'input_value'
+      ? words.includes(all[0])
+      : true;
+  return {
+    ...line,
+    fieldType: keepsSyntax ? line.fieldType : undefined,
+    pairedLabel: keepsSyntax ? line.pairedLabel : undefined,
+    text: eliminateAnomalySymbols(words.map(w => w.text).join(' ')),
+    words,
+    bbox: {
+      x0: Math.min(...words.map(w => w.bbox.x0)),
+      y0: Math.min(...words.map(w => w.bbox.y0)),
+      x1: Math.max(...words.map(w => w.bbox.x1)),
+      y1: Math.max(...words.map(w => w.bbox.y1))
+    }
+  };
+}
+
+/**
+ * Combine the two OCR passes word by word. The block pass reads a whole screen row as one line and
+ * can garble single words (`nama:` read as `LE`); where the sparse pass read the same spot clearly,
+ * its reading replaces just those weak words.
+ */
+function mergeOcrPasses(primary: RawOcrLineItem[], extra: RawOcrLineItem[]): RawOcrLineItem[] {
+  let merged = [...primary];
+  for (const cand of extra) {
+    const candCy = (cand.bbox.y0 + cand.bbox.y1) / 2;
+    const candH = Math.max(8, cand.bbox.y1 - cand.bbox.y0);
+    const candConf = lineConfidence(cand) ?? 0;
+    const overlapsCand = (b: OcrBox) =>
+      Math.max(0, Math.min(cand.bbox.x1, b.x1) - Math.max(cand.bbox.x0, b.x0)) >= (b.x1 - b.x0) * 0.5;
+
+    const sameSpot = merged
+      .map((ex, idx) => ({ ex, idx }))
+      .filter(({ ex }) => {
+        const exCy = (ex.bbox.y0 + ex.bbox.y1) / 2;
+        if (Math.abs(candCy - exCy) >= Math.max(candH, ex.bbox.y1 - ex.bbox.y0) * 0.65) return false;
+        const overlapX = Math.max(0, Math.min(cand.bbox.x1, ex.bbox.x1) - Math.max(cand.bbox.x0, ex.bbox.x0));
+        const minW = Math.max(1, Math.min(cand.bbox.x1 - cand.bbox.x0, ex.bbox.x1 - ex.bbox.x0));
+        return overlapX / minW > 0.45;
+      });
+
+    if (sameSpot.length === 0) {
+      merged.push(cand);
+      continue;
+    }
+
+    // The candidate wins only if it is clearly more confident than every word it would replace
+    const wins = sameSpot.every(({ ex }) => {
+      const covered = (ex.words || []).filter(w => overlapsCand(w.bbox));
+      if (covered.length === 0) return false;
+      const coveredConf = covered.reduce((s, w) => s + (w.confidence ?? 0), 0) / covered.length;
+      return candConf >= coveredConf + 15;
+    });
+    if (!wins) continue;
+
+    const replacedIdx = new Set(sameSpot.map(s => s.idx));
+    const shrunk: RawOcrLineItem[] = [];
+    for (const { ex } of sameSpot) {
+      const remaining = (ex.words || []).filter(w => !overlapsCand(w.bbox));
+      if (remaining.length > 0) shrunk.push(rebuildLineFromWords(ex, remaining));
+    }
+    merged = [...merged.filter((_, idx) => !replacedIdx.has(idx)), ...shrunk, cand];
+  }
+  return merged;
+}
+
+/**
+ * Tesseract in two passes: a block read (PSM 6), then a sparse read (PSM 11) on a copy with
+ * input-box borders erased so single words inside inputs are found. Small text is read at 2×.
+ * Returned boxes are in the original image's pixel coordinates.
+ */
+async function runTesseractPasses(
+  baseDataUrl: string,
+  imgW: number,
+  imgH: number,
+  opts: { secondPass: 'always' | 'if-sparse'; progressPrefix: string; onProgress?: (s: string) => void }
+): Promise<RawOcrLineItem[]> {
+  const { secondPass, progressPrefix, onProgress } = opts;
+  const worker = await getOrCreateOcrWorker();
+
+  onProgress?.(`${progressPrefix} Tesseract reading text...`.trim());
+  await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
+  const firstRead = await worker.recognize(baseDataUrl, {}, { text: true, blocks: true });
+  let blockLines = extractLinesFromOcrData(firstRead?.data);
+
+  const textHeight = medianWordHeight(blockLines);
+  const scale =
+    textHeight !== null && textHeight < OCR_MIN_TEXT_HEIGHT
+      ? Math.min(2, OCR_MAX_UPSCALED_SIDE / Math.max(imgW, imgH))
+      : 1;
+  const upscaled = scale >= 1.25;
+  let source = baseDataUrl;
+  if (upscaled) {
+    onProgress?.(
+      `${progressPrefix} small text (~${Math.round(textHeight!)}px), re-reading at ${scale.toFixed(1)}×...`.trim()
+    );
+    source = await upscaleImage(baseDataUrl, imgW, imgH, scale);
+    const sharperRead = await worker.recognize(source, {}, { text: true, blocks: true });
+    blockLines = scaleOcrLines(extractLinesFromOcrData(sharperRead?.data), 1 / scale);
+  }
+
+  let sparseLines: RawOcrLineItem[] = [];
+  if (secondPass === 'always' || blockLines.length < 8) {
+    onProgress?.(`${progressPrefix} second pass for words inside input boxes...`.trim());
+    const { borderCleanedDataUrl } = await prepareImageForHighSensitivityOcr(source);
+    await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
+    const sparseRead = await worker.recognize(borderCleanedDataUrl, {}, { text: true, blocks: true });
+    sparseLines = scaleOcrLines(extractLinesFromOcrData(sparseRead?.data), upscaled ? 1 / scale : 1);
+    await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
+  }
+
+  return mergeOcrPasses(blockLines, sparseLines);
+}
+
+/**
+ * OCR one image with the chosen engine (PaddleOCR falls back to Tesseract), then measure the layout
+ * facts used to pair labels with values. Faces mark photo areas where OCR "text" is ignored.
+ */
+async function runOcrForImage(
+  baseDataUrl: string,
+  imgW: number,
+  imgH: number,
+  engine: OcrEngineType,
+  faces: FaceBox[],
+  opts: { secondPass: 'always' | 'if-sparse'; progressPrefix: string; onProgress?: (s: string) => void }
+): Promise<{ rawOcrLines: RawOcrLineItem[]; usedEngine: OcrEngineType }> {
+  const { pixelData } = await prepareImageForHighSensitivityOcr(baseDataUrl);
+
+  let lines: RawOcrLineItem[] = [];
+  let usedEngine: OcrEngineType = engine;
+  if (engine === 'paddleocr') {
+    try {
+      const paddleRes = await runPaddleOcrOnImage(baseDataUrl, imgW, imgH, status =>
+        opts.onProgress?.(`${opts.progressPrefix} ${status}`.trim())
+      );
+      lines = paddleRes.lines;
+    } catch (paddleErr) {
+      console.warn('PaddleOCR failed on image, falling back to Tesseract:', paddleErr);
+      usedEngine = 'tesseract';
+    }
+  }
+  if (usedEngine === 'tesseract' || lines.length === 0) {
+    lines = await runTesseractPasses(baseDataUrl, imgW, imgH, opts);
+    usedEngine = 'tesseract';
+  }
+
+  opts.onProgress?.(`${opts.progressPrefix} pairing labels with values...`.trim());
+  return { rawOcrLines: analyzeOcrLayout(lines, pixelData, imgW, imgH, faces), usedEngine };
+}
+
+/**
+ * Pair a detected image with a raw XObject stream only when its aspect ratio identifies it uniquely.
+ * Streams are listed in resource-dictionary order, not paint order, so pairing by index can swap images.
+ */
+function pickRawXObjectForMatch<T extends { width: number; height: number }>(
+  candidates: T[],
+  imgMatch: DetectedMatch
+): T | null {
+  const placedW = imgMatch.unclippedWidth ?? imgMatch.width;
+  const placedH = imgMatch.unclippedHeight ?? imgMatch.height;
+  if (!(placedW > 0 && placedH > 0)) return null;
+
+  const placedAspect = placedW / placedH;
+  const sameShape = candidates.filter(
+    c => c.width > 0 && c.height > 0 && Math.abs(Math.log(c.width / c.height / placedAspect)) < 0.02
+  );
+  return sameShape.length === 1 ? sameShape[0] : null;
+}
+
 export async function autoScanImagesWithOcr(
   pdfBuffer: ArrayBuffer,
   imageMatches: DetectedMatch[],
@@ -2128,9 +2330,23 @@ export async function autoScanImagesWithOcr(
       if (shouldCancel?.()) break;
 
       const page = await pdfDoc.getPage(pageIdx + 1);
-      const rawPageXObjects = pdfLibDoc
-        ? await extractRawUncroppedImagesFromPdfPage(pdfLibDoc, pageIdx)
-        : [];
+      // Building the operator list makes PDF.js decode this page's images into `page.objs`,
+      // so each match can be paired with the exact image it was detected from via `imageObjId`
+      if (pageImgMatches.some(m => m.imageObjId)) {
+        await page.getOperatorList().catch(() => null);
+      }
+
+      // Raw stream decoding is expensive, so only do it if a match on this page actually needs it
+      let rawPageXObjectsPromise: Promise<{ dataUrl: string; width: number; height: number }[]> | null =
+        null;
+      const getRawPageXObjects = () => {
+        if (!rawPageXObjectsPromise) {
+          rawPageXObjectsPromise = pdfLibDoc
+            ? extractRawUncroppedImagesFromPdfPage(pdfLibDoc, pageIdx)
+            : Promise.resolve([]);
+        }
+        return rawPageXObjectsPromise;
+      };
 
       for (let mIdx = 0; mIdx < pageImgMatches.length; mIdx++) {
         if (shouldCancel?.()) break;
@@ -2158,24 +2374,23 @@ export async function autoScanImagesWithOcr(
           }
         }
 
-        // 1. Second priority: Raw uncropped PDF XObject stream from pdf-lib
-        if (!baseDataUrl) {
-          const rawXObj =
-            rawPageXObjects[mIdx] || (rawPageXObjects.length === 1 ? rawPageXObjects[0] : null);
-          if (rawXObj) {
-            baseDataUrl = rawXObj.dataUrl;
-            imgW = rawXObj.width;
-            imgH = rawXObj.height;
-          }
-        }
-
-        // 2. Third priority: Direct PDF.js Image XObject extraction
+        // 1. Second priority: the exact PDF.js Image XObject painted for this match (uncropped, native resolution)
         if (!baseDataUrl) {
           const nativeExtracted = await extractNativePdfImageObject(page, imgMatch.imageObjId);
           if (nativeExtracted) {
             baseDataUrl = nativeExtracted.dataUrl;
             imgW = nativeExtracted.width;
             imgH = nativeExtracted.height;
+          }
+        }
+
+        // 2. Third priority: Raw uncropped PDF XObject stream from pdf-lib, only when it can be identified unambiguously
+        if (!baseDataUrl) {
+          const rawXObj = pickRawXObjectForMatch(await getRawPageXObjects(), imgMatch);
+          if (rawXObj) {
+            baseDataUrl = rawXObj.dataUrl;
+            imgW = rawXObj.width;
+            imgH = rawXObj.height;
           }
         }
 
@@ -2235,97 +2450,36 @@ export async function autoScanImagesWithOcr(
 
         if (shouldCancel?.()) break;
 
+        onProgress?.(`Detecting faces in image ${processedCount}/${totalImages}...`);
+        const rawFaceBoxes = await detectFacesSafely(baseDataUrl);
+
         let rawOcrLines: RawOcrLineItem[] = [];
-        let subBoxes: InImageSubBox[] = [];
         let usedEngine: OcrEngineType = engine;
-
         try {
-          const { borderCleanedDataUrl, pixelData } = await prepareImageForHighSensitivityOcr(
-            baseDataUrl
-          );
-
-          if (engine === 'paddleocr') {
-            try {
-              onProgress?.(
-                `PaddleOCR scanning image ${processedCount}/${totalImages}: [1/3] Reading text -> [2/3] Eliminating anomaly symbols (!@#$%^&*) -> [3/3] Redacting...`
-              );
-              const paddleRes = await runPaddleOcrOnImage(
-                baseDataUrl,
-                imgW,
-                imgH,
-                status => onProgress?.(`[Image ${processedCount}/${totalImages}] ${status}`)
-              );
-              onProgress?.(
-                `[Image ${processedCount}/${totalImages}] [2/3] Anomaly symbols eliminated (!@#$%^&* kept) • [3/3] Classifying and auto-redacting values...`
-              );
-              rawOcrLines = classifyAndPairOcrLines(paddleRes.lines, pixelData, imgW, imgH);
-              subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imgW, imgH);
-              usedEngine = 'paddleocr';
-            } catch (paddleErr) {
-              console.warn('PaddleOCR failed on image, falling back to Tesseract:', paddleErr);
-              usedEngine = 'tesseract';
+          ({ rawOcrLines, usedEngine } = await runOcrForImage(
+            baseDataUrl,
+            imgW,
+            imgH,
+            engine,
+            rawFaceBoxes,
+            {
+              secondPass: totalImages <= 12 ? 'always' : 'if-sparse',
+              progressPrefix: `Image ${processedCount}/${totalImages}:`,
+              onProgress
             }
-          }
-
-          if (usedEngine === 'tesseract' || rawOcrLines.length === 0) {
-            onProgress?.(
-              `Tesseract OCR scanning image ${processedCount}/${totalImages}: [1/3] Reading text -> [2/3] Eliminating anomaly symbols (!@#$%^&*) -> [3/3] Redacting...`
-            );
-            const worker = await getOrCreateOcrWorker();
-            await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
-            const pass1Result = await worker.recognize(
-              baseDataUrl,
-              {},
-              { text: true, blocks: true }
-            );
-            const pass1Lines = extractLinesFromOcrData(pass1Result?.data, imgW);
-
-            let pass2Lines: RawOcrLineItem[] = [];
-            if (totalImages <= 12 || pass1Lines.length < 8) {
-              await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
-              const pass2Result = await worker.recognize(
-                borderCleanedDataUrl,
-                {},
-                { text: true, blocks: true }
-              );
-              pass2Lines = extractLinesFromOcrData(pass2Result?.data, imgW);
-              await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
-            }
-
-            const mergedLines: RawOcrLineItem[] = [...pass1Lines];
-            for (const cand of pass2Lines) {
-              const candCy = (cand.bbox.y0 + cand.bbox.y1) / 2;
-              const candH = Math.max(8, cand.bbox.y1 - cand.bbox.y0);
-
-              const alreadyExists = mergedLines.some((ex) => {
-                const exCy = (ex.bbox.y0 + ex.bbox.y1) / 2;
-                const sameRow =
-                  Math.abs(candCy - exCy) < Math.max(candH, ex.bbox.y1 - ex.bbox.y0) * 0.65;
-                if (!sameRow) return false;
-
-                const overlapX = Math.max(
-                  0,
-                  Math.min(cand.bbox.x1, ex.bbox.x1) - Math.max(cand.bbox.x0, ex.bbox.x0)
-                );
-                const minW = Math.max(
-                  1,
-                  Math.min(cand.bbox.x1 - cand.bbox.x0, ex.bbox.x1 - ex.bbox.x0)
-                );
-                return overlapX / minW > 0.45;
-              });
-
-              if (!alreadyExists) {
-                mergedLines.push(cand);
-              }
-            }
-
-            rawOcrLines = classifyAndPairOcrLines(mergedLines, pixelData, imgW, imgH);
-            subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imgW, imgH);
-            usedEngine = 'tesseract';
-          }
+          ));
         } catch (ocrErr) {
           console.warn('OCR scan warning on image', ocrErr);
         }
+
+        const subBoxes = evaluateOcrLinesAgainstRules(
+          rawOcrLines,
+          rules,
+          imgW,
+          imgH,
+          undefined,
+          rawFaceBoxes
+        );
 
         const redactedDataUrl = await renderSanitizedImageWithSubBoxes(
           baseDataUrl,
@@ -2339,6 +2493,7 @@ export async function autoScanImagesWithOcr(
           imagePixelWidth: imgW,
           imagePixelHeight: imgH,
           rawOcrLines,
+          rawFaceBoxes,
           subBoxes,
           ocrEngineUsed: usedEngine,
           imageMode: 'partial',
@@ -2372,75 +2527,31 @@ export async function scanSingleImageWithOcr(
   onProgress?: (statusText: string) => void
 ): Promise<{
   rawOcrLines: RawOcrLineItem[];
+  rawFaceBoxes: FaceBox[];
   subBoxes: InImageSubBox[];
   redactedImageDataUrl: string;
   engineUsed: OcrEngineType;
 }> {
-  let rawOcrLines: RawOcrLineItem[] = [];
-  let subBoxes: InImageSubBox[] = [];
-  let usedEngine: OcrEngineType = engine;
+  onProgress?.('Detecting faces...');
+  const rawFaceBoxes = await detectFacesSafely(imageDataUrl);
 
-  const { borderCleanedDataUrl, pixelData } = await prepareImageForHighSensitivityOcr(
-    imageDataUrl
+  const { rawOcrLines, usedEngine } = await runOcrForImage(
+    imageDataUrl,
+    imageWidth,
+    imageHeight,
+    engine,
+    rawFaceBoxes,
+    { secondPass: 'always', progressPrefix: '', onProgress }
   );
 
-  if (engine === 'paddleocr') {
-    try {
-      onProgress?.('PaddleOCR: [1/3] Reading text -> [2/3] Eliminating anomaly symbols (!@#$%^&*) -> [3/3] Redacting...');
-      const paddleRes = await runPaddleOcrOnImage(
-        imageDataUrl,
-        imageWidth,
-        imageHeight,
-        status => onProgress?.(status)
-      );
-      onProgress?.('[2/3] Anomaly symbols eliminated (!@#$%^&* kept) • [3/3] Redacting detected fields...');
-      rawOcrLines = classifyAndPairOcrLines(paddleRes.lines, pixelData, imageWidth, imageHeight);
-      subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imageWidth, imageHeight);
-      usedEngine = 'paddleocr';
-    } catch (paddleErr) {
-      console.warn('PaddleOCR failed on single image, falling back to Tesseract:', paddleErr);
-      usedEngine = 'tesseract';
-    }
-  }
-
-  if (usedEngine === 'tesseract' || rawOcrLines.length === 0) {
-    onProgress?.('Tesseract OCR: [1/3] Reading text -> [2/3] Eliminating anomaly symbols (!@#$%^&*) -> [3/3] Redacting...');
-    const worker = await getOrCreateOcrWorker();
-    await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
-    const pass1Result = await worker.recognize(
-      imageDataUrl,
-      {},
-      { text: true, blocks: true }
-    );
-    const pass1Lines = extractLinesFromOcrData(pass1Result?.data, imageWidth);
-
-    await worker.setParameters({ tessedit_pageseg_mode: '11' as any });
-    const pass2Result = await worker.recognize(
-      borderCleanedDataUrl,
-      {},
-      { text: true, blocks: true }
-    );
-    const pass2Lines = extractLinesFromOcrData(pass2Result?.data, imageWidth);
-    await worker.setParameters({ tessedit_pageseg_mode: '6' as any });
-
-    const mergedLines = [...pass1Lines];
-    for (const cand of pass2Lines) {
-      const candCy = (cand.bbox.y0 + cand.bbox.y1) / 2;
-      const candH = Math.max(8, cand.bbox.y1 - cand.bbox.y0);
-      const exists = mergedLines.some((ex) => {
-        const exCy = (ex.bbox.y0 + ex.bbox.y1) / 2;
-        if (Math.abs(candCy - exCy) >= Math.max(candH, ex.bbox.y1 - ex.bbox.y0) * 0.65) return false;
-        const overlapX = Math.max(0, Math.min(cand.bbox.x1, ex.bbox.x1) - Math.max(cand.bbox.x0, ex.bbox.x0));
-        const minW = Math.max(1, Math.min(cand.bbox.x1 - cand.bbox.x0, ex.bbox.x1 - ex.bbox.x0));
-        return overlapX / minW > 0.45;
-      });
-      if (!exists) mergedLines.push(cand);
-    }
-
-    rawOcrLines = classifyAndPairOcrLines(mergedLines, pixelData, imageWidth, imageHeight);
-    subBoxes = evaluateOcrLinesAgainstRules(rawOcrLines, rules, imageWidth, imageHeight);
-    usedEngine = 'tesseract';
-  }
+  const subBoxes = evaluateOcrLinesAgainstRules(
+    rawOcrLines,
+    rules,
+    imageWidth,
+    imageHeight,
+    undefined,
+    rawFaceBoxes
+  );
 
   const redactedImageDataUrl = await renderSanitizedImageWithSubBoxes(
     imageDataUrl,
@@ -2450,6 +2561,7 @@ export async function scanSingleImageWithOcr(
 
   return {
     rawOcrLines,
+    rawFaceBoxes,
     subBoxes,
     redactedImageDataUrl,
     engineUsed: usedEngine
@@ -2553,15 +2665,18 @@ function sanitizeAndRewirePageAnnotations(
 }
 
 /**
- * Apply redaction rectangles, sanitized readable images, & local full-size attachment pages to the PDF using pdf-lib
+ * Apply redaction rectangles, sanitized readable images, & local full-size attachment pages to the PDF using pdf-lib,
+ * then flatten every redacted page so the covered content is removed from the file (see `rebuildWithFlattenedPages`)
  */
 export async function applyRedactionsToPdf(
   pdfBuffer: ArrayBuffer,
   matchesToRedact: DetectedMatch[],
-  options: RedactionStyleOptions
+  options: RedactionStyleOptions,
+  onProgress?: (statusText: string) => void
 ): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.load(pdfBuffer.slice(0));
   const pages = pdfDoc.getPages();
+  const originalPageCount = pages.length;
   const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
@@ -2842,7 +2957,245 @@ export async function applyRedactionsToPdf(
     }
   }
 
-  return await pdfDoc.save();
+  const redactedPageIdxs = new Set(
+    [...matchesByPage.keys()].filter(pageIdx => pageIdx < originalPageCount)
+  );
+  return await rebuildWithFlattenedPages(pdfDoc, redactedPageIdxs, onProgress);
+}
+
+// Flattening renders a page to a bitmap: drawing a box with pdf-lib only paints over content,
+// the text and images underneath stay in the file and can be copied or extracted.
+const FLATTEN_RENDER_SCALE = 2.5; // ~180 DPI
+const FLATTEN_MAX_CANVAS_PIXELS = 16_000_000;
+const FLATTEN_JPEG_QUALITY = 0.92;
+
+interface PreservedLink {
+  rect: [number, number, number, number];
+  uri?: string;
+  targetPageIdx?: number;
+}
+
+/**
+ * Read a page's link annotations as plain data, so they can be recreated in the rebuilt document
+ * without carrying over references into the unflattened source pages.
+ */
+function collectPreservedLinks(
+  pdfDoc: PDFDocument,
+  page: PDFPage,
+  pageIdxByRef: Map<string, number>
+): PreservedLink[] {
+  const links: PreservedLink[] = [];
+  const annots = page.node.lookupMaybe(PDFName.of('Annots'), PDFArray);
+  if (!annots) return links;
+
+  for (let i = 0; i < annots.size(); i++) {
+    const annot = pdfDoc.context.lookupMaybe(annots.get(i), PDFDict);
+    if (!annot || annot.lookup(PDFName.of('Subtype'))?.toString() !== '/Link') continue;
+
+    const rectObj = annot.lookupMaybe(PDFName.of('Rect'), PDFArray);
+    if (!rectObj || rectObj.size() < 4) continue;
+    const r = [0, 1, 2, 3].map(k => {
+      const n = rectObj.lookup(k) as any;
+      return Number(n?.asNumber?.() ?? NaN);
+    });
+    if (r.some(v => !isFinite(v))) continue;
+    const rect: PreservedLink['rect'] = [
+      Math.min(r[0], r[2]),
+      Math.min(r[1], r[3]),
+      Math.max(r[0], r[2]),
+      Math.max(r[1], r[3])
+    ];
+
+    const action = annot.lookupMaybe(PDFName.of('A'), PDFDict);
+    const actionType = action?.lookup(PDFName.of('S'))?.toString();
+    if (action && actionType === '/URI') {
+      const uriObj = action.lookup(PDFName.of('URI'));
+      if (uriObj instanceof PDFString || uriObj instanceof PDFHexString) {
+        links.push({ rect, uri: uriObj.decodeText() });
+      }
+      continue;
+    }
+
+    const dest =
+      action && actionType === '/GoTo'
+        ? action.lookup(PDFName.of('D'))
+        : annot.lookup(PDFName.of('Dest'));
+    if (dest instanceof PDFArray && dest.size() > 0) {
+      const targetRef = dest.get(0);
+      const targetPageIdx =
+        targetRef instanceof PDFRef ? pageIdxByRef.get(targetRef.toString()) : undefined;
+      if (targetPageIdx !== undefined) links.push({ rect, targetPageIdx });
+    }
+  }
+  return links;
+}
+
+/** The resource dictionaries a page draws from; pages sharing one of these can reach each other's images. */
+function getPageResourceDicts(page: PDFPage): PDFDict[] {
+  const resources = page.node.Resources();
+  if (!resources) return [];
+  const xObjects = resources.lookupMaybe(PDFName.of('XObject'), PDFDict);
+  return xObjects ? [resources, xObjects] : [resources];
+}
+
+function hasNonLinkAnnotations(pdfDoc: PDFDocument, page: PDFPage): boolean {
+  const annots = page.node.lookupMaybe(PDFName.of('Annots'), PDFArray);
+  if (!annots) return false;
+  for (let i = 0; i < annots.size(); i++) {
+    const annot = pdfDoc.context.lookupMaybe(annots.get(i), PDFDict);
+    if (annot && annot.lookup(PDFName.of('Subtype'))?.toString() !== '/Link') return true;
+  }
+  return false;
+}
+
+async function renderPageToJpeg(
+  pdfJsDoc: any,
+  pageIdx: number
+): Promise<{ jpegBytes: ArrayBuffer; viewport: any }> {
+  const pdfJsPage = await pdfJsDoc.getPage(pageIdx + 1);
+  const viewport = pdfJsPage.getViewport({ scale: 1 });
+  const scale = Math.min(
+    FLATTEN_RENDER_SCALE,
+    Math.sqrt(FLATTEN_MAX_CANVAS_PIXELS / (viewport.width * viewport.height))
+  );
+  const renderViewport = pdfJsPage.getViewport({ scale });
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.ceil(renderViewport.width);
+  canvas.height = Math.ceil(renderViewport.height);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D context unavailable for page flattening');
+
+  try {
+    await pdfJsPage.render({ canvas, canvasContext: ctx, viewport: renderViewport }).promise;
+    const blob = await new Promise<Blob | null>(resolve =>
+      canvas.toBlob(resolve, 'image/jpeg', FLATTEN_JPEG_QUALITY)
+    );
+    if (!blob) throw new Error(`Failed to encode flattened page ${pageIdx + 1}`);
+    return { jpegBytes: await blob.arrayBuffer(), viewport };
+  } finally {
+    // Release the backing store right away; large PDFs otherwise exhaust canvas memory
+    canvas.width = 0;
+    canvas.height = 0;
+    pdfJsPage.cleanup();
+  }
+}
+
+/**
+ * Build the export document from the stamped one:
+ * - Redacted pages are rendered to images, so nothing hidden under a redaction box survives.
+ * - Other pages are copied as-is (text stays selectable), unless they share resource dictionaries with
+ *   a redacted page, in which case copying them would also copy the original images; those get flattened too.
+ * - Links are recreated from plain data, and document-level metadata, bookmarks, forms and attachments
+ *   are dropped, since none of them are covered by redaction.
+ */
+async function rebuildWithFlattenedPages(
+  stampedDoc: PDFDocument,
+  redactedPageIdxs: Set<number>,
+  onProgress?: (statusText: string) => void
+): Promise<Uint8Array> {
+  const stampedPages = stampedDoc.getPages();
+
+  const flattenIdxs = new Set(redactedPageIdxs);
+  const redactedResourceDicts = new Set<PDFDict>();
+  for (const idx of redactedPageIdxs) {
+    getPageResourceDicts(stampedPages[idx]).forEach(d => redactedResourceDicts.add(d));
+  }
+  stampedPages.forEach((page, idx) => {
+    // Form fields, stamps and comments can't be copied safely (they reference other pages and the
+    // AcroForm), so pages carrying them are flattened to keep their appearance
+    if (
+      getPageResourceDicts(page).some(d => redactedResourceDicts.has(d)) ||
+      hasNonLinkAnnotations(stampedDoc, page)
+    ) {
+      flattenIdxs.add(idx);
+    }
+  });
+
+  const pageIdxByRef = new Map(stampedPages.map((p, idx) => [p.ref.toString(), idx]));
+  const linksByPage = stampedPages.map(p => collectPreservedLinks(stampedDoc, p, pageIdxByRef));
+
+  // Strip everything on kept pages that can point at other pages, so copying them can't pull a
+  // redacted source page into the output as an unreferenced object
+  const copyIdxs = stampedPages.map((_, idx) => idx).filter(idx => !flattenIdxs.has(idx));
+  for (const idx of copyIdxs) {
+    for (const key of ['Annots', 'B', 'AA']) {
+      stampedPages[idx].node.delete(PDFName.of(key));
+    }
+  }
+
+  const stampedBytes = await stampedDoc.save();
+  const pdfJsLoadingTask = pdfjsLib.getDocument({ data: stampedBytes.slice(0), verbosity: 0 });
+  const pdfJsDoc = await pdfJsLoadingTask.promise;
+  const outDoc = await PDFDocument.create();
+  const copiedPages = await outDoc.copyPages(stampedDoc, copyIdxs);
+
+  const outPages: PDFPage[] = [];
+  // Maps a point in the stamped page's PDF space to the output page's PDF space
+  const toOutRect: ((rect: PreservedLink['rect']) => PreservedLink['rect'])[] = [];
+  let copiedCursor = 0;
+  let flattenedCount = 0;
+
+  try {
+    for (let idx = 0; idx < stampedPages.length; idx++) {
+      if (!flattenIdxs.has(idx)) {
+        outPages.push(outDoc.addPage(copiedPages[copiedCursor++]));
+        toOutRect.push(rect => rect);
+        continue;
+      }
+
+      flattenedCount++;
+      onProgress?.(`Flattening redacted page ${flattenedCount} of ${flattenIdxs.size}...`);
+      const { jpegBytes, viewport } = await renderPageToJpeg(pdfJsDoc, idx);
+      const jpg = await outDoc.embedJpg(jpegBytes);
+      const outPage = outDoc.addPage([viewport.width, viewport.height]);
+      outPage.drawImage(jpg, { x: 0, y: 0, width: viewport.width, height: viewport.height });
+      outPages.push(outPage);
+
+      // The viewport accounts for /Rotate and CropBox offsets; its y axis points down
+      const pageH = viewport.height;
+      toOutRect.push(rect => {
+        const [vx0, vy0] = viewport.convertToViewportPoint(rect[0], rect[1]);
+        const [vx1, vy1] = viewport.convertToViewportPoint(rect[2], rect[3]);
+        return [
+          Math.min(vx0, vx1),
+          pageH - Math.max(vy0, vy1),
+          Math.max(vx0, vx1),
+          pageH - Math.min(vy0, vy1)
+        ];
+      });
+    }
+  } finally {
+    await pdfJsLoadingTask.destroy();
+  }
+
+  outPages.forEach((outPage, idx) => {
+    const annotRefs = linksByPage[idx].map(link => {
+      const rect = toOutRect[idx](link.rect);
+      const annot =
+        link.uri !== undefined
+          ? outDoc.context.obj({
+              Type: 'Annot',
+              Subtype: 'Link',
+              Rect: rect,
+              Border: [0, 0, 0],
+              A: { Type: 'Action', S: 'URI', URI: PDFString.of(link.uri) }
+            })
+          : outDoc.context.obj({
+              Type: 'Annot',
+              Subtype: 'Link',
+              Rect: rect,
+              Border: [0, 0, 0],
+              Dest: [outPages[link.targetPageIdx!].ref, 'XYZ', null, null, null]
+            });
+      return outDoc.context.register(annot);
+    });
+    if (annotRefs.length > 0) {
+      outPage.node.set(PDFName.of('Annots'), outDoc.context.obj(annotRefs));
+    }
+  });
+
+  return await outDoc.save();
 }
 
 /**

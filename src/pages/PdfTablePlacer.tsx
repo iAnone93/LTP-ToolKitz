@@ -18,12 +18,29 @@ import {
   Info,
   Check,
   ExternalLink,
-  RefreshCw
+  RefreshCw,
+  CopyPlus,
+  ClipboardCopy,
+  ClipboardPaste
 } from 'lucide-react';
 import PDFPreview from '../components/PdfTablePlacer/PDFPreview';
-import { readFileAsArrayBuffer, insertTableIntoPDF } from '../utils/pdfUtils';
-import { TableData, Placement, ProcessingStatus, SignatureData } from '../types';
+import { readFileAsArrayBuffer, insertTablesIntoPDF } from '../utils/pdfUtils';
+import { TableData, Placement, ProcessingStatus, SignatureData, PlacedTable } from '../types';
 import ImageProcessorModal from '../components/PdfTablePlacer/ImageProcessorModal';
+
+/** A table's content; where it sits is tracked separately so dragging doesn't fill the undo history */
+interface TableItem {
+  id: string;
+  data: TableData;
+}
+
+const FIRST_TABLE_ID = 'table-1';
+const DEFAULT_PLACEMENT: Omit<Placement, 'pageIndex'> = { x: 60, y: 540, pageWidth: 612, pageHeight: 792 };
+// A duplicate (or a second paste on the same spot) lands this far right and down, so both stay visible
+const COPY_OFFSET = 20;
+
+const newTableId = () => `table-${Math.random().toString(36).substring(2, 11)}`;
+const cloneTableData = (data: TableData): TableData => JSON.parse(JSON.stringify(data));
 
 // Initial Data with Dimensions
 const INITIAL_TABLE_DATA: TableData = {
@@ -105,7 +122,12 @@ const TABLE_PRESETS: { id: string; name: string; desc: string; data: TableData }
 const PdfTablePlacer: React.FC = () => {
   const [file, setFile] = useState<File | null>(null);
   const [fileData, setFileData] = useState<ArrayBuffer | null>(null);
-  const [placement, setPlacement] = useState<Placement | null>(null);
+  const [placements, setPlacements] = useState<Record<string, Placement>>({});
+  const [activeTableId, setActiveTableId] = useState<string>(FIRST_TABLE_ID);
+  const [tableClipboard, setTableClipboard] = useState<{ data: TableData; placement: Placement | null } | null>(null);
+  const [tableNotice, setTableNotice] = useState<string | null>(null);
+  // Whether the user is working with a table right now, so Ctrl+C / Ctrl+D target it
+  const tableFocusedRef = useRef(false);
   const [status, setStatus] = useState<ProcessingStatus>('idle');
 
   // Signature State
@@ -125,21 +147,95 @@ const PdfTablePlacer: React.FC = () => {
   // Zoom scale
   const [scale, setScale] = useState<number>(1.1);
 
-  // History Management
-  const [history, setHistory] = useState<TableData[]>([INITIAL_TABLE_DATA]);
+  // History Management: every table's content, so edits, duplicates, pastes and removals can be undone
+  const [history, setHistory] = useState<TableItem[][]>([[{ id: FIRST_TABLE_ID, data: INITIAL_TABLE_DATA }]]);
   const [historyIndex, setHistoryIndex] = useState(0);
-  const tableData = history[historyIndex];
+  const tables = history[historyIndex];
+  const activeTable = tables.find(t => t.id === activeTableId) ?? tables[0];
+  const tableData = activeTable.data;
+  const activePlacement: Placement | null = placements[activeTable.id] ?? null;
+  const placedTables: PlacedTable[] = tables
+    .filter(t => placements[t.id])
+    .map(t => ({ ...t, placement: placements[t.id] }));
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleTableDataChange = useCallback((newData: TableData) => {
-    setHistory(prev => {
-      const newHistory = prev.slice(0, historyIndex + 1);
-      newHistory.push(newData);
-      return newHistory;
-    });
+  const commitTables = useCallback((next: TableItem[]) => {
+    setHistory(prev => [...prev.slice(0, historyIndex + 1), next]);
     setHistoryIndex(prev => prev + 1);
   }, [historyIndex]);
+
+  const handleTableDataChange = useCallback((id: string, newData: TableData) => {
+    commitTables(tables.map(t => (t.id === id ? { ...t, data: newData } : t)));
+  }, [tables, commitTables]);
+
+  const setTablePlacement = useCallback((id: string, placement: Placement) => {
+    setPlacements(prev => ({ ...prev, [id]: placement }));
+  }, []);
+
+  const showTableNotice = (text: string) => {
+    setTableNotice(text);
+    window.setTimeout(() => setTableNotice(current => (current === text ? null : current)), 2500);
+  };
+
+  // A spot on the page no other table already starts at, stepping diagonally from `from`
+  const findFreeSpot = (from: Placement, alwaysOffset: boolean): Placement => {
+    const occupied = (p: Placement) =>
+      placedTables.some(
+        t => t.placement.pageIndex === p.pageIndex && Math.abs(t.placement.x - p.x) < 1 && Math.abs(t.placement.y - p.y) < 1
+      );
+    let spot = alwaysOffset ? { ...from, x: from.x + COPY_OFFSET, y: from.y - COPY_OFFSET } : from;
+    for (let guard = 0; occupied(spot) && guard < 50; guard++) {
+      spot = { ...spot, x: spot.x + COPY_OFFSET, y: spot.y - COPY_OFFSET };
+    }
+    return spot;
+  };
+
+  const duplicateTable = (id: string) => {
+    const index = tables.findIndex(t => t.id === id);
+    if (index === -1) return;
+    const copy: TableItem = { id: newTableId(), data: cloneTableData(tables[index].data) };
+    commitTables([...tables.slice(0, index + 1), copy, ...tables.slice(index + 1)]);
+    if (placements[id]) setTablePlacement(copy.id, findFreeSpot(placements[id], true));
+    setActiveTableId(copy.id);
+    showTableNotice('Table duplicated');
+  };
+
+  const copyTable = (id: string) => {
+    const source = tables.find(t => t.id === id);
+    if (!source) return;
+    setTableClipboard({ data: cloneTableData(source.data), placement: placements[id] ?? null });
+    showTableNotice('Table copied — scroll to any page and press Ctrl+V (or Paste)');
+  };
+
+  // Pastes onto the page being viewed, at the copied table's position
+  const pasteTable = () => {
+    if (!tableClipboard || !fileData) return;
+    const copy: TableItem = { id: newTableId(), data: cloneTableData(tableClipboard.data) };
+    commitTables([...tables, copy]);
+    const target: Placement = tableClipboard.placement
+      ? { ...tableClipboard.placement, pageIndex: activePageIndex }
+      : { ...DEFAULT_PLACEMENT, pageIndex: activePageIndex };
+    setTablePlacement(copy.id, findFreeSpot(target, false));
+    setActiveTableId(copy.id);
+    showTableNotice(`Table pasted on page ${activePageIndex + 1}`);
+  };
+
+  const removeTable = (id: string) => {
+    if (tables.length > 1) {
+      // Its position is kept, so undo brings the table back where it was
+      const index = tables.findIndex(t => t.id === id);
+      const remaining = tables.filter(t => t.id !== id);
+      commitTables(remaining);
+      if (activeTableId === id) setActiveTableId(remaining[Math.max(0, index - 1)].id);
+    } else {
+      // The last table keeps its content, ready to be placed again
+      setPlacements(prev => {
+        const { [id]: _removed, ...rest } = prev;
+        return rest;
+      });
+    }
+  };
 
   const undo = useCallback(() => {
     if (historyIndex > 0) {
@@ -153,33 +249,72 @@ const PdfTablePlacer: React.FC = () => {
     }
   }, [historyIndex, history.length]);
 
+  // A table counts as focused from a click on it until a click anywhere else
+  useEffect(() => {
+    const handleMouseDown = (e: MouseEvent) => {
+      tableFocusedRef.current = !!(e.target as HTMLElement | null)?.closest?.('[data-table-overlay]');
+    };
+    document.addEventListener('mousedown', handleMouseDown, true);
+    return () => document.removeEventListener('mousedown', handleMouseDown, true);
+  }, []);
+
   // Keyboard Shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+      const mod = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+      if (mod && key === 'z') {
         e.preventDefault();
         if (e.shiftKey) {
           redo();
         } else {
           undo();
         }
-      } else if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
+        return;
+      }
+      if (mod && key === 'y') {
         e.preventDefault();
         redo();
+        return;
+      }
+
+      // Table copy / paste / duplicate. Typing in a cell and selected page text keep native behaviour.
+      // A table's own cell paste (cells selected on the page being viewed) runs first and marks the
+      // event handled. Ctrl+C on a table always copies the table too, even when it also copied a cell.
+      const target = e.target as HTMLElement | null;
+      const typing = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+      if (!mod || e.shiftKey || e.altKey || typing) return;
+      if (key !== 'c' && e.defaultPrevented) return;
+
+      const activeIsPlaced = !!placements[activeTable.id];
+      if (key === 'c' && tableFocusedRef.current && activeIsPlaced && !window.getSelection()?.toString()) {
+        e.preventDefault();
+        copyTable(activeTable.id);
+      } else if (key === 'd' && tableFocusedRef.current && activeIsPlaced) {
+        e.preventDefault(); // also stops the browser's "bookmark this page"
+        duplicateTable(activeTable.id);
+      } else if (key === 'v' && tableClipboard && fileData) {
+        e.preventDefault();
+        pasteTable();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [undo, redo]);
+  });
+
+  const resetTables = () => {
+    setPlacements({});
+    setHistory([[{ id: FIRST_TABLE_ID, data: INITIAL_TABLE_DATA }]]);
+    setHistoryIndex(0);
+    setActiveTableId(FIRST_TABLE_ID);
+  };
 
   const handleRemoveFile = () => {
     setFile(null);
     setFileData(null);
-    setPlacement(null);
     setSignatures([]);
     setActivePageIndex(0);
-    setHistory([INITIAL_TABLE_DATA]);
-    setHistoryIndex(0);
+    resetTables();
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -195,11 +330,9 @@ const PdfTablePlacer: React.FC = () => {
         const buffer = await readFileAsArrayBuffer(selectedFile);
         setFileData(buffer);
         setStatus('idle');
-        setPlacement(null);
         setSignatures([]);
         setActivePageIndex(0);
-        setHistory([INITIAL_TABLE_DATA]);
-        setHistoryIndex(0);
+        resetTables();
         setIsSidebarOpen(false);
       } catch (error) {
         console.error("File read error", error);
@@ -210,11 +343,11 @@ const PdfTablePlacer: React.FC = () => {
 
   const handleDownload = async () => {
     if (!fileData) return;
-    if (!placement && signatures.length === 0) return;
-    
+    if (placedTables.length === 0 && signatures.length === 0) return;
+
     setStatus('processing');
     try {
-      const newPdfBytes = await insertTableIntoPDF(fileData, tableData, placement, signatures);
+      const newPdfBytes = await insertTablesIntoPDF(fileData, placedTables, signatures);
       const blob = new Blob([newPdfBytes as any], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -264,15 +397,9 @@ const PdfTablePlacer: React.FC = () => {
       setSignatures(prev => prev.filter(s => s.id !== id));
   };
 
-  // Place or center table on current page
+  // Place or center the active table on the current page
   const handlePlaceTableOnActivePage = () => {
-    setPlacement({
-      pageIndex: activePageIndex,
-      x: 60,
-      y: 540,
-      pageWidth: 612,
-      pageHeight: 792
-    });
+    setTablePlacement(activeTable.id, { ...DEFAULT_PLACEMENT, pageIndex: activePageIndex });
     // Scroll to page
     const el = document.getElementById(`pdf-page-container-${activePageIndex}`);
     if (el) {
@@ -282,8 +409,8 @@ const PdfTablePlacer: React.FC = () => {
 
   // Quick Preset Selection
   const applyPreset = (preset: typeof TABLE_PRESETS[0]) => {
-    handleTableDataChange(preset.data);
-    if (!placement) {
+    handleTableDataChange(activeTable.id, cloneTableData(preset.data));
+    if (!activePlacement) {
       handlePlaceTableOnActivePage();
     }
   };
@@ -386,7 +513,7 @@ const PdfTablePlacer: React.FC = () => {
           {/* Primary Action Button: Download PDF */}
           <button
             onClick={handleDownload}
-            disabled={!fileData || (!placement && signatures.length === 0) || status === 'processing'}
+            disabled={!fileData || (placedTables.length === 0 && signatures.length === 0) || status === 'processing'}
             className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed rounded-lg shadow-xs transition-all"
             title="Generate and export updated PDF"
           >
@@ -452,9 +579,11 @@ const PdfTablePlacer: React.FC = () => {
               }`}
             >
               <Table2 size={13} />
-              <span>Table</span>
-              {placement && (
-                <span className="w-1.5 h-1.5 rounded-full bg-indigo-600"></span>
+              <span>Tables</span>
+              {placedTables.length > 0 && (
+                <span className="px-1.5 py-0.2 bg-indigo-100 text-indigo-800 rounded-full text-[10px] font-mono">
+                  {placedTables.length}
+                </span>
               )}
             </button>
 
@@ -496,15 +625,15 @@ const PdfTablePlacer: React.FC = () => {
             {/* ============================================================== */}
             {activeStudioTab === 'table' && (
               <div className="space-y-4">
-                {/* Placement Status Card */}
+                {/* Placement Status Card (for the active table) */}
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex flex-col gap-2">
                   <div className="flex items-center justify-between">
                     <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
-                      Placement Status
+                      {tables.length > 1 ? `Table ${tables.indexOf(activeTable) + 1} Placement` : 'Placement Status'}
                     </span>
-                    {placement ? (
+                    {activePlacement ? (
                       <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
-                        <CheckCircle size={10} /> Page {placement.pageIndex + 1}
+                        <CheckCircle size={10} /> Page {activePlacement.pageIndex + 1}
                       </span>
                     ) : (
                       <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200">
@@ -514,8 +643,8 @@ const PdfTablePlacer: React.FC = () => {
                   </div>
 
                   <p className="text-[11px] text-slate-600 leading-relaxed">
-                    {placement
-                      ? `Table is positioned on Page ${placement.pageIndex + 1}. Drag the table border to relocate or use handles to resize.`
+                    {activePlacement
+                      ? `Table is positioned on Page ${activePlacement.pageIndex + 1}. Drag the table border to relocate or use handles to resize.`
                       : 'Click anywhere on the PDF sheet in the canvas to place your table, or use the quick button below.'}
                   </p>
 
@@ -528,7 +657,7 @@ const PdfTablePlacer: React.FC = () => {
                         <Upload size={13} />
                         <span>Upload PDF First</span>
                       </button>
-                    ) : !placement ? (
+                    ) : !activePlacement ? (
                       <button
                         onClick={handlePlaceTableOnActivePage}
                         className="flex-1 py-1.5 px-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium text-xs transition-colors flex items-center justify-center gap-1.5 shadow-xs"
@@ -546,9 +675,9 @@ const PdfTablePlacer: React.FC = () => {
                           Center on Page {activePageIndex + 1}
                         </button>
                         <button
-                          onClick={() => setPlacement(null)}
+                          onClick={() => removeTable(activeTable.id)}
                           className="py-1.5 px-2.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg font-medium text-xs transition-colors flex items-center gap-1"
-                          title="Remove Table Placement"
+                          title="Remove this table"
                         >
                           <Trash2 size={13} />
                           <span>Remove</span>
@@ -557,6 +686,85 @@ const PdfTablePlacer: React.FC = () => {
                     )}
                   </div>
                 </div>
+
+                {/* All Tables: select, duplicate, copy & paste across pages */}
+                {fileData && (
+                  <div className="p-3 bg-white border border-slate-200 rounded-xl space-y-2">
+                    <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">
+                      Tables on this document ({placedTables.length})
+                    </span>
+
+                    {placedTables.length === 0 ? (
+                      <p className="text-[11px] text-slate-400">No table placed yet.</p>
+                    ) : (
+                      <div className="flex flex-col gap-1.5">
+                        {tables.map((t, index) => {
+                          const p = placements[t.id];
+                          if (!p) return null;
+                          const isActive = t.id === activeTable.id;
+                          return (
+                            <div
+                              key={t.id}
+                              onClick={() => {
+                                setActiveTableId(t.id);
+                                scrollToPage(p.pageIndex);
+                              }}
+                              className={`p-2 rounded-lg border flex items-center justify-between gap-2 cursor-pointer transition-colors ${
+                                isActive ? 'bg-indigo-50/70 border-indigo-200' : 'bg-white border-slate-200 hover:border-slate-300'
+                              }`}
+                            >
+                              <div className="min-w-0">
+                                <span className="font-semibold text-slate-800 block text-xs">Table {index + 1}</span>
+                                <span className="text-[10px] text-slate-500 font-mono">
+                                  Page {p.pageIndex + 1} · {t.data.headers.length}×{t.data.rows.length + 1}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-0.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                                <button
+                                  onClick={() => duplicateTable(t.id)}
+                                  className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-slate-100 rounded"
+                                  title="Duplicate next to it (Ctrl+D)"
+                                >
+                                  <CopyPlus size={13} />
+                                </button>
+                                <button
+                                  onClick={() => copyTable(t.id)}
+                                  className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-slate-100 rounded"
+                                  title="Copy, then paste on any page (Ctrl+C)"
+                                >
+                                  <ClipboardCopy size={13} />
+                                </button>
+                                <button
+                                  onClick={() => removeTable(t.id)}
+                                  className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded"
+                                  title="Remove this table"
+                                >
+                                  <Trash2 size={13} />
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <button
+                      onClick={pasteTable}
+                      disabled={!tableClipboard}
+                      className="w-full py-1.5 px-3 bg-white hover:bg-indigo-50 disabled:hover:bg-white border border-slate-200 text-slate-700 disabled:text-slate-300 rounded-lg font-medium text-xs transition-colors flex items-center justify-center gap-1.5"
+                      title={tableClipboard ? 'Paste the copied table onto the page you are viewing (Ctrl+V)' : 'Copy a table first'}
+                    >
+                      <ClipboardPaste size={13} />
+                      <span>{tableClipboard ? `Paste on Page ${activePageIndex + 1}` : 'Paste (copy a table first)'}</span>
+                    </button>
+
+                    {tableNotice && (
+                      <p className="text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-2 py-1">
+                        {tableNotice}
+                      </p>
+                    )}
+                  </div>
+                )}
 
                 {/* Table Dimensions & Structure Summary */}
                 <div className="p-3 bg-white border border-slate-200 rounded-xl space-y-2">
@@ -806,9 +1014,9 @@ const PdfTablePlacer: React.FC = () => {
                       </span>
                     </div>
                     <div className="flex items-center justify-between text-slate-600">
-                      <span>Table Placed:</span>
+                      <span>Tables Placed:</span>
                       <span className="font-semibold text-slate-800">
-                        {placement ? `Page ${placement.pageIndex + 1}` : 'None'}
+                        {placedTables.length || 'None'}
                       </span>
                     </div>
                     <div className="flex items-center justify-between text-slate-600">
@@ -821,7 +1029,7 @@ const PdfTablePlacer: React.FC = () => {
 
                   <button
                     onClick={handleDownload}
-                    disabled={!fileData || (!placement && signatures.length === 0)}
+                    disabled={!fileData || (placedTables.length === 0 && signatures.length === 0)}
                     className="w-full mt-2 py-2 px-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 text-white rounded-lg text-xs font-semibold transition-all flex items-center justify-center gap-1.5 shadow-xs"
                   >
                     <Download size={13} />
@@ -836,12 +1044,17 @@ const PdfTablePlacer: React.FC = () => {
         {/* Main Canvas Viewport Area */}
         <section className="flex-1 bg-slate-100/60 p-4 sm:p-6 flex flex-col h-full overflow-hidden relative z-10">
           <PDFPreview 
-            fileData={fileData} 
-            onPlacementSelect={setPlacement}
-            selectedPlacement={placement}
-            tableData={tableData}
+            fileData={fileData}
+            tables={placedTables}
+            canPlaceActiveTable={!!fileData && !activePlacement}
+            activeTableId={activeTable.id}
+            onPlaceActiveTable={(p) => setTablePlacement(activeTable.id, p)}
+            onTablePlacementChange={setTablePlacement}
             onTableDataChange={handleTableDataChange}
-            onDeleteTable={() => setPlacement(null)}
+            onDeleteTable={removeTable}
+            onDuplicateTable={duplicateTable}
+            onCopyTable={copyTable}
+            onActivateTable={setActiveTableId}
             signatures={signatures}
             onSignatureUpdate={updateSignature}
             onSignatureRemove={removeSignature}

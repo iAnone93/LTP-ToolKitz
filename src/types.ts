@@ -41,6 +41,13 @@ export interface Placement {
   pageHeight: number;
 }
 
+/** A table on the document: its own content plus where it sits */
+export interface PlacedTable {
+  id: string;
+  data: TableData;
+  placement: Placement;
+}
+
 export interface PDFPageInfo {
   pageIndex: number;
   width: number;

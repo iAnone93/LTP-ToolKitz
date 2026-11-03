@@ -5,7 +5,7 @@ import {
   Plus, Merge as MergeIcon, Split, Trash2, Eraser, Columns, Rows,
   Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, 
   ArrowUpToLine, ArrowDownToLine, AlignVerticalJustifyCenter, Move,
-  ArrowDownRight, Copy, ClipboardPaste
+  ArrowDownRight, Copy, ClipboardPaste, ClipboardCopy, CopyPlus
 } from 'lucide-react';
 
 interface TableOverlayProps {
@@ -14,6 +14,17 @@ interface TableOverlayProps {
   onDelete: () => void;
   scale: number;
   onDragStart: (e: React.MouseEvent) => void;
+  /** Copy the whole table, to paste on any page */
+  onCopyTable?: () => void;
+  /** Place a copy of this table right next to it */
+  onDuplicate?: () => void;
+  /** The user started working with this table (so page-level shortcuts target it) */
+  onActivate?: () => void;
+  /**
+   * Whether this table is on the page being viewed. Ctrl+V only pastes into this table's selected
+   * cells when it is; otherwise the key is left to the page, which pastes the copied table there.
+   */
+  isOnViewedPage?: boolean;
 }
 
 interface Selection {
@@ -26,7 +37,11 @@ const TableOverlay: React.FC<TableOverlayProps> = ({
   onChange, 
   onDelete,
   scale,
-  onDragStart
+  onDragStart,
+  onCopyTable,
+  onDuplicate,
+  onActivate,
+  isOnViewedPage = true
 }) => {
   const FONT_SIZE = 10;
   
@@ -182,38 +197,39 @@ const TableOverlay: React.FC<TableOverlayProps> = ({
          setCopiedStyle({ ...style });
       }
 
-      // Paste (Ctrl+V)
-      if (isCtrlOrMeta && key === 'v') {
+      // Paste (Ctrl+V) into the selected cells. Off-screen (the user scrolled to another page),
+      // or with no cell copied, the key goes to the page, which pastes the copied table instead.
+      if (isCtrlOrMeta && key === 'v' && copiedCell && isOnViewedPage) {
          e.preventDefault();
-         if (copiedCell) {
-             const r1 = Math.min(selection.start.r, selection.end.r);
-             const r2 = Math.max(selection.start.r, selection.end.r);
-             const c1 = Math.min(selection.start.c, selection.end.c);
-             const c2 = Math.max(selection.start.c, selection.end.c);
+         const r1 = Math.min(selection.start.r, selection.end.r);
+         const r2 = Math.max(selection.start.r, selection.end.r);
+         const c1 = Math.min(selection.start.c, selection.end.c);
+         const c2 = Math.max(selection.start.c, selection.end.c);
 
-             const newHeaders = [...data.headers];
-             const newRows = data.rows.map(r => [...r]);
-             const newStyles = { ...styles };
+         const newHeaders = [...data.headers];
+         const newRows = data.rows.map(r => [...r]);
+         const newStyles = { ...styles };
 
-             for(let r = r1; r <= r2; r++) {
-                 for(let c = c1; c <= c2; c++) {
-                     // Paste Text
-                     if (r === 0) newHeaders[c] = copiedCell.text;
-                     else newRows[r-1][c] = copiedCell.text;
-                     
-                     // Paste Style
-                     newStyles[`${r},${c}`] = { ...copiedCell.style };
-                 }
+         for(let r = r1; r <= r2; r++) {
+             for(let c = c1; c <= c2; c++) {
+                 // Paste Text
+                 if (r === 0) newHeaders[c] = copiedCell.text;
+                 else newRows[r-1][c] = copiedCell.text;
+                 
+                 // Paste Style
+                 newStyles[`${r},${c}`] = { ...copiedCell.style };
              }
-
-             onChange({ ...data, headers: newHeaders, rows: newRows, styles: newStyles });
          }
+
+         onChange({ ...data, headers: newHeaders, rows: newRows, styles: newStyles });
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selection, editingCell, copiedCell, data, styles, onChange]);
+    // On document, so it runs before the page's window-level table copy/paste and can claim the keys
+    // (preventDefault) while cells are selected
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [selection, editingCell, copiedCell, data, styles, onChange, isOnViewedPage]);
 
 
   // --- Selection Logic ---
@@ -822,8 +838,13 @@ const TableOverlay: React.FC<TableOverlayProps> = ({
 
 
   return (
-    <div ref={overlayRef} className="relative group/table select-none bg-white shadow-2xl">
-      
+    <div
+      ref={overlayRef}
+      data-table-overlay
+      className="relative group/table select-none bg-white shadow-2xl"
+      onMouseDownCapture={() => onActivate?.()}
+    >
+
       {/* --- Move Handle (Top Left) --- */}
       {isTableActive && (
         <div 
@@ -838,18 +859,44 @@ const TableOverlay: React.FC<TableOverlayProps> = ({
         </div>
       )}
 
-      {/* --- Delete Table Button (Top Right - Conditional) --- */}
+      {/* --- Table Actions: a column under the move handle, clear of the cell toolbars above the table --- */}
       {isTableActive && (
-        <button
-          onClick={(e) => {
-              e.stopPropagation();
-              onDelete();
-          }}
-          className="absolute -top-10 right-0 z-[70] flex items-center justify-center bg-red-600 text-white w-8 h-8 rounded shadow hover:bg-red-700 transition-all animate-in fade-in slide-in-from-bottom-2 duration-200"
-          title="Delete Entire Table"
-        >
-          <Trash2 size={16} />
-        </button>
+        <div className="absolute top-8 -left-8 mt-1 z-[70] flex flex-col gap-1 animate-in fade-in duration-200">
+          {onCopyTable && (
+            <button
+              onClick={(e) => {
+                  e.stopPropagation();
+                  onCopyTable();
+              }}
+              className="flex items-center justify-center bg-white text-slate-700 border border-slate-300 w-8 h-8 rounded-l-md shadow hover:bg-slate-100 transition-colors"
+              title="Copy Table (Ctrl+C) — then paste on any page with Ctrl+V"
+            >
+              <ClipboardCopy size={16} />
+            </button>
+          )}
+          {onDuplicate && (
+            <button
+              onClick={(e) => {
+                  e.stopPropagation();
+                  onDuplicate();
+              }}
+              className="flex items-center justify-center bg-indigo-600 text-white w-8 h-8 rounded-l-md shadow hover:bg-indigo-700 transition-colors"
+              title="Duplicate Table (Ctrl+D)"
+            >
+              <CopyPlus size={16} />
+            </button>
+          )}
+          <button
+            onClick={(e) => {
+                e.stopPropagation();
+                onDelete();
+            }}
+            className="flex items-center justify-center bg-red-600 text-white w-8 h-8 rounded-l-md shadow hover:bg-red-700 transition-colors"
+            title="Delete Entire Table"
+          >
+            <Trash2 size={16} />
+          </button>
+        </div>
       )}
 
       {/* Selection Toolbar (Only when NOT editing text) */}

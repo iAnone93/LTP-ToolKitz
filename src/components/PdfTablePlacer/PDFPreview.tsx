@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { getPDFDocument } from '../../utils/pdfUtils';
-import { Placement, TableData, SignatureData } from '../../types';
+import { Placement, TableData, SignatureData, PlacedTable } from '../../types';
 import { 
   ZoomIn, 
   ZoomOut, 
@@ -17,11 +17,19 @@ import SignatureOverlay from './SignatureOverlay';
 
 interface PDFPreviewProps {
   fileData: ArrayBuffer | null;
-  onPlacementSelect: (placement: Placement) => void;
-  selectedPlacement: Placement | null;
-  tableData: TableData;
-  onTableDataChange: (data: TableData) => void;
-  onDeleteTable: () => void;
+  /** Tables currently placed on the document */
+  tables: PlacedTable[];
+  /** The active table isn't placed yet: clicking a page places it there */
+  canPlaceActiveTable: boolean;
+  /** The table being worked on; drawn above the others so a duplicate never hides it */
+  activeTableId: string;
+  onPlaceActiveTable: (placement: Placement) => void;
+  onTablePlacementChange: (id: string, placement: Placement) => void;
+  onTableDataChange: (id: string, data: TableData) => void;
+  onDeleteTable: (id: string) => void;
+  onDuplicateTable: (id: string) => void;
+  onCopyTable: (id: string) => void;
+  onActivateTable: (id: string) => void;
   signatures: SignatureData[];
   onSignatureUpdate: (sig: SignatureData) => void;
   onSignatureRemove: (id: string) => void;
@@ -33,12 +41,17 @@ interface PDFPreviewProps {
 }
 
 const PDFPreview: React.FC<PDFPreviewProps> = ({ 
-  fileData, 
-  onPlacementSelect, 
-  selectedPlacement,
-  tableData,
+  fileData,
+  tables,
+  canPlaceActiveTable,
+  activeTableId,
+  onPlaceActiveTable,
+  onTablePlacementChange,
   onTableDataChange,
   onDeleteTable,
+  onDuplicateTable,
+  onCopyTable,
+  onActivateTable,
   signatures,
   onSignatureUpdate,
   onSignatureRemove,
@@ -211,7 +224,7 @@ const PDFPreview: React.FC<PDFPreviewProps> = ({
     if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).closest('button')) {
       return;
     }
-    if (selectedPlacement) return;
+    if (!canPlaceActiveTable) return;
     if (!containerRef.current) return;
     
     const rect = (e.target as HTMLElement).getBoundingClientRect();
@@ -221,7 +234,7 @@ const PDFPreview: React.FC<PDFPreviewProps> = ({
     const xPdf = xCanvas / scale;
     const yPdf = (viewport.height - yCanvas) / scale;
 
-    onPlacementSelect({
+    onPlaceActiveTable({
       pageIndex,
       x: xPdf,
       y: yPdf,
@@ -288,7 +301,7 @@ const PDFPreview: React.FC<PDFPreviewProps> = ({
 
         {/* Center: Contextual Tool Hint */}
         <div className="hidden lg:flex items-center gap-2 text-xs">
-          {!selectedPlacement ? (
+          {canPlaceActiveTable ? (
             <span className="text-amber-800 bg-amber-50 px-2.5 py-1 rounded-full border border-amber-200 flex items-center gap-1.5 animate-pulse">
               <Table2 size={12} className="text-amber-600" />
               <span>Click anywhere on any page to place the custom table</span>
@@ -296,7 +309,9 @@ const PDFPreview: React.FC<PDFPreviewProps> = ({
           ) : (
             <span className="text-indigo-800 bg-indigo-50 px-2.5 py-1 rounded-full border border-indigo-200 flex items-center gap-1.5">
               <Sparkles size={12} className="text-indigo-600" />
-              <span>Table active on Page {selectedPlacement.pageIndex + 1} · Double-click cells to edit text</span>
+              <span>
+                {tables.length} {tables.length === 1 ? 'table' : 'tables'} placed · Double-click cells to edit · Ctrl+C / Ctrl+V copies a table to another page
+              </span>
             </span>
           )}
         </div>
@@ -355,9 +370,9 @@ const PDFPreview: React.FC<PDFPreviewProps> = ({
               </span>
               
               <div className="flex items-center gap-1.5 text-[11px]">
-                {selectedPlacement?.pageIndex === i && (
+                {tables.some(t => t.placement.pageIndex === i) && (
                   <span className="bg-indigo-50 text-indigo-700 border border-indigo-200 px-2 py-0.5 rounded-full font-medium flex items-center gap-1">
-                    <Table2 size={11} /> Table Placed
+                    <Table2 size={11} /> {tables.filter(t => t.placement.pageIndex === i).length} Table(s)
                   </span>
                 )}
                 {signatures.filter(s => s.pageIndex === i).length > 0 && (
@@ -374,11 +389,16 @@ const PDFPreview: React.FC<PDFPreviewProps> = ({
               pageIndex={i} 
               scale={scale} 
               onClick={(e, vp) => handleCanvasClick(e, i, vp)}
-              selectedPlacement={selectedPlacement?.pageIndex === i ? selectedPlacement : null}
-              tableData={tableData}
+              tables={tables.filter(t => t.placement.pageIndex === i)}
+              canPlaceTable={canPlaceActiveTable}
+              activeTableId={activeTableId}
+              isViewedPage={i === activePageIndex}
               onTableDataChange={onTableDataChange}
               onDeleteTable={onDeleteTable}
-              onPlacementUpdate={onPlacementSelect}
+              onDuplicateTable={onDuplicateTable}
+              onCopyTable={onCopyTable}
+              onActivateTable={onActivateTable}
+              onPlacementUpdate={onTablePlacementChange}
               signatures={signatures.filter(s => s.pageIndex === i)}
               onSignatureUpdate={onSignatureUpdate}
               onSignatureRemove={onSignatureRemove}
@@ -446,11 +466,17 @@ interface PDFPageProps {
   pageIndex: number;
   scale: number;
   onClick: (e: React.MouseEvent<HTMLDivElement>, viewport: any) => void;
-  selectedPlacement: Placement | null;
-  tableData: TableData;
-  onTableDataChange: (data: TableData) => void;
-  onDeleteTable: () => void;
-  onPlacementUpdate: (placement: Placement) => void;
+  /** Tables placed on this page */
+  tables: PlacedTable[];
+  canPlaceTable: boolean;
+  activeTableId: string;
+  isViewedPage: boolean;
+  onTableDataChange: (id: string, data: TableData) => void;
+  onDeleteTable: (id: string) => void;
+  onDuplicateTable: (id: string) => void;
+  onCopyTable: (id: string) => void;
+  onActivateTable: (id: string) => void;
+  onPlacementUpdate: (id: string, placement: Placement) => void;
   signatures: SignatureData[];
   onSignatureUpdate: (sig: SignatureData) => void;
   onSignatureRemove: (id: string) => void;
@@ -462,11 +488,16 @@ const PDFPage: React.FC<PDFPageProps> = ({
   pdfDoc, 
   pageIndex, 
   scale, 
-  onClick, 
-  selectedPlacement,
-  tableData,
+  onClick,
+  tables,
+  canPlaceTable,
+  activeTableId,
+  isViewedPage,
   onTableDataChange,
   onDeleteTable,
+  onDuplicateTable,
+  onCopyTable,
+  onActivateTable,
   onPlacementUpdate,
   signatures,
   onSignatureUpdate,
@@ -478,10 +509,13 @@ const PDFPage: React.FC<PDFPageProps> = ({
   const [viewport, setViewport] = useState<any>(null);
   const renderTaskRef = useRef<any>(null);
   
-  // Drag State (for table)
-  const [isDraggingTable, setIsDraggingTable] = useState(false);
-  const [dragStartTable, setDragStartTable] = useState<{ x: number; y: number } | null>(null);
-  const [initialPlacement, setInitialPlacement] = useState<{ x: number; y: number } | null>(null);
+  // Drag State (for the table being moved on this page)
+  const [tableDrag, setTableDrag] = useState<{
+    id: string;
+    start: { x: number; y: number };
+    initial: Placement;
+  } | null>(null);
+  const isDraggingTable = tableDrag !== null;
 
   useEffect(() => {
     let isMounted = true;
@@ -538,47 +572,35 @@ const PDFPage: React.FC<PDFPageProps> = ({
   }, [pdfDoc, pageIndex, scale]);
 
   // Handle Dragging Table
-  const handleDragStart = (e: React.MouseEvent) => {
-    e.stopPropagation(); 
+  const handleDragStart = (e: React.MouseEvent, table: PlacedTable) => {
+    e.stopPropagation();
     e.preventDefault();
-    if (!selectedPlacement) return;
-
-    setIsDraggingTable(true);
-    setDragStartTable({ x: e.clientX, y: e.clientY });
-    setInitialPlacement({ x: selectedPlacement.x, y: selectedPlacement.y });
+    setTableDrag({ id: table.id, start: { x: e.clientX, y: e.clientY }, initial: table.placement });
   };
 
   useEffect(() => {
+    if (!tableDrag) return;
+
     const handleMouseMove = (e: MouseEvent) => {
-      if (!isDraggingTable || !dragStartTable || !initialPlacement || !selectedPlacement) return;
+      const deltaPdfX = (e.clientX - tableDrag.start.x) / scale;
+      const deltaPdfY = (e.clientY - tableDrag.start.y) / scale;
 
-      const deltaX = e.clientX - dragStartTable.x;
-      const deltaY = e.clientY - dragStartTable.y;
-      const deltaPdfX = deltaX / scale;
-      const deltaPdfY = deltaY / scale;
-
-      onPlacementUpdate({
-        ...selectedPlacement,
-        x: initialPlacement.x + deltaPdfX,
-        y: initialPlacement.y - deltaPdfY 
+      onPlacementUpdate(tableDrag.id, {
+        ...tableDrag.initial,
+        x: tableDrag.initial.x + deltaPdfX,
+        y: tableDrag.initial.y - deltaPdfY
       });
     };
 
-    const handleMouseUp = () => {
-      setIsDraggingTable(false);
-      setDragStartTable(null);
-      setInitialPlacement(null);
-    };
+    const handleMouseUp = () => setTableDrag(null);
 
-    if (isDraggingTable) {
-      window.addEventListener('mousemove', handleMouseMove);
-      window.addEventListener('mouseup', handleMouseUp);
-    }
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
     return () => {
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [isDraggingTable, dragStartTable, initialPlacement, scale, selectedPlacement, onPlacementUpdate]);
+  }, [tableDrag, scale, onPlacementUpdate]);
 
   return (
     <div 
@@ -610,28 +632,33 @@ const PDFPage: React.FC<PDFPageProps> = ({
            </div>
         )}
 
-        {/* Interactive Table Overlay */}
-        {selectedPlacement && viewport && (
-          <div 
-            className="absolute z-10"
+        {/* Interactive Table Overlays */}
+        {viewport && tables.map(table => (
+          <div
+            key={table.id}
+            className={`absolute ${table.id === activeTableId ? 'z-20' : 'z-10'}`}
             style={{
-              left: selectedPlacement.x * scale,
-              top: viewport.height - (selectedPlacement.y * scale),
+              left: table.placement.x * scale,
+              top: viewport.height - (table.placement.y * scale),
             }}
-            onClick={(e) => e.stopPropagation()} 
+            onClick={(e) => e.stopPropagation()}
           >
-             <TableOverlay 
-               data={tableData} 
-               onChange={onTableDataChange} 
-               onDelete={onDeleteTable}
-               scale={scale} 
-               onDragStart={handleDragStart}
+             <TableOverlay
+               data={table.data}
+               onChange={(data) => onTableDataChange(table.id, data)}
+               onDelete={() => onDeleteTable(table.id)}
+               onCopyTable={() => onCopyTable(table.id)}
+               onDuplicate={() => onDuplicateTable(table.id)}
+               onActivate={() => onActivateTable(table.id)}
+               isOnViewedPage={isViewedPage}
+               scale={scale}
+               onDragStart={(e) => handleDragStart(e, table)}
              />
           </div>
-        )}
-        
+        ))}
+
         {/* Hover Placement Cue */}
-        {!selectedPlacement && (
+        {canPlaceTable && (
           <div className="absolute inset-0 opacity-0 group-hover:opacity-100 bg-indigo-950/5 pointer-events-none transition-opacity duration-200 flex items-center justify-center cursor-crosshair">
               <span className="bg-white/95 text-slate-800 text-xs font-semibold px-3 py-1.5 rounded-lg shadow-md border border-slate-200 backdrop-blur-xs flex items-center gap-1.5">
                   <Table2 size={13} className="text-indigo-600" />

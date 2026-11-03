@@ -1,8 +1,7 @@
 import * as XLSX from 'xlsx';
 import * as pdfjsLib from 'pdfjs-dist';
 
-// Configure PDF worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.mjs`;
+import './pdfjsWorker';
 
 export type CompareMode = 'code' | 'text' | 'spreadsheet' | 'pdf';
 

@@ -149,6 +149,8 @@ const PdfRedactor: React.FC = () => {
   const [rules, setRules] = useState<RedactionRule[]>(DEFAULT_REDACTION_RULES);
   const [customPattern, setCustomPattern] = useState<string>('');
   const [customName, setCustomName] = useState<string>('Custom Rule');
+  const [editingLabelsRuleId, setEditingLabelsRuleId] = useState<string | null>(null);
+  const [newSensitiveLabel, setNewSensitiveLabel] = useState<string>('');
   const [detectedMatches, setDetectedMatches] = useState<DetectedMatch[]>([]);
   const [manualMatches, setManualMatches] = useState<DetectedMatch[]>([]);
   const [isDrawMode, setIsDrawMode] = useState<boolean>(false);
@@ -353,7 +355,8 @@ const PdfRedactor: React.FC = () => {
                     rules,
                     cached.imagePixelWidth,
                     cached.imagePixelHeight,
-                    cached.subBoxes
+                    cached.subBoxes,
+                    cached.rawFaceBoxes
                   );
                   const freshRedactedUrl = await renderSanitizedImageWithSubBoxes(
                     cached.originalImageDataUrl,
@@ -878,6 +881,26 @@ const PdfRedactor: React.FC = () => {
     setRules(prev => prev.filter(r => r.id !== ruleId));
   };
 
+  // Edit the sensitive field labels of the "Sensitive Fields in Images" rule
+  const handleAddSensitiveLabel = (ruleId: string) => {
+    const label = newSensitiveLabel.trim();
+    if (!label) return;
+    setRules(prev =>
+      prev.map(r =>
+        r.id === ruleId && !(r.labels || []).some(l => l.toLowerCase() === label.toLowerCase())
+          ? { ...r, labels: [...(r.labels || []), label] }
+          : r
+      )
+    );
+    setNewSensitiveLabel('');
+  };
+
+  const handleRemoveSensitiveLabel = (ruleId: string, label: string) => {
+    setRules(prev =>
+      prev.map(r => (r.id === ruleId ? { ...r, labels: (r.labels || []).filter(l => l !== label) } : r))
+    );
+  };
+
   // Match selection toggle
   const handleToggleMatch = (matchId: string) => {
     if (matchId.startsWith('manual-')) {
@@ -920,6 +943,7 @@ const PdfRedactor: React.FC = () => {
       imagePixelWidth: nextMatch.imagePixelWidth,
       imagePixelHeight: nextMatch.imagePixelHeight,
       rawOcrLines: nextMatch.rawOcrLines,
+      rawFaceBoxes: nextMatch.rawFaceBoxes,
       subBoxes: nextMatch.subBoxes,
       imageMode: nextMatch.imageMode,
       createLocalFullSizePage: nextMatch.createLocalFullSizePage
@@ -957,7 +981,8 @@ const PdfRedactor: React.FC = () => {
       ...m,
       subBoxes: (m.subBoxes || []).map(b => ({
         ...b,
-        selected: b.fieldType === 'input_value' || b.id.startsWith('custom-')
+        selected:
+          b.fieldType === 'input_value' || b.fieldType === 'face' || b.id.startsWith('custom-')
       }))
     }));
   };
@@ -1003,6 +1028,7 @@ const PdfRedactor: React.FC = () => {
         );
         const upd: Partial<DetectedMatch> = {
           rawOcrLines: res.rawOcrLines,
+          rawFaceBoxes: res.rawFaceBoxes,
           subBoxes: res.subBoxes,
           redactedImageDataUrl: res.redactedImageDataUrl,
           ocrEngineUsed: res.engineUsed
@@ -1158,6 +1184,25 @@ const PdfRedactor: React.FC = () => {
     return detectedMatches.find(m => m.id === activeImageModalId) || null;
   }, [activeImageModalId, detectedMatches]);
 
+  // "100%" in the image modal means: as wide as the viewport allows, never enlarged past native size.
+  // The viewport reserves its scrollbar gutter: otherwise a scrollbar appearing for a tall image
+  // narrows it, the image shrinks, the scrollbar goes away, and the image flickers between sizes.
+  const [modalViewportWidth, setModalViewportWidth] = useState<number>(0);
+  useEffect(() => {
+    const vp = modalViewportRef.current;
+    if (!activeImageModalId || !vp) return;
+    const observer = new ResizeObserver(entries => {
+      const width = Math.floor(entries[0].contentRect.width);
+      setModalViewportWidth(prev => (Math.abs(prev - width) < 2 ? prev : width));
+    });
+    observer.observe(vp);
+    return () => observer.disconnect();
+  }, [activeImageModalId]);
+  const modalFitWidth = Math.max(
+    120,
+    Math.min(activeImageModalMatch?.imagePixelWidth || Infinity, (modalViewportWidth || 728) - 48)
+  );
+
   // Select / Deselect all matches
   const handleToggleSelectAll = (select: boolean) => {
     setManualMatches(prev => prev.map(m => ({ ...m, selected: select })));
@@ -1308,7 +1353,8 @@ const PdfRedactor: React.FC = () => {
       const redactedPdfBytes = await applyRedactionsToPdf(
         pdfBuffer,
         finalMatchesToExport,
-        redactionOptions
+        redactionOptions,
+        status => setOcrStatusText(status)
       );
 
       const outBuffer = new ArrayBuffer(redactedPdfBytes.byteLength);
@@ -1392,6 +1438,7 @@ const PdfRedactor: React.FC = () => {
           <button
             onClick={handleApplyRedactions}
             disabled={isScanning || isExporting || selectedMatchesCount === 0}
+            title="Redacted pages are flattened into images, so text and images under the redaction boxes cannot be recovered"
             className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:hover:bg-rose-600 rounded-lg shadow-xs transition-all"
           >
             {isExporting ? (
@@ -1498,8 +1545,8 @@ const PdfRedactor: React.FC = () => {
                 {/* Built-in Rule Toggles */}
                 <div className="space-y-1.5">
                   {rules.map(rule => (
+                    <React.Fragment key={rule.id}>
                     <div
-                      key={rule.id}
                       className={`p-2.5 rounded-xl border transition-all flex items-center justify-between cursor-pointer ${
                         rule.enabled
                           ? 'bg-slate-50/80 border-slate-300 shadow-2xs'
@@ -1542,7 +1589,64 @@ const PdfRedactor: React.FC = () => {
                           <Trash2 size={13} />
                         </button>
                       )}
+
+                      {rule.labels && rule.enabled && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingLabelsRuleId(prev => (prev === rule.id ? null : rule.id));
+                          }}
+                          className="shrink-0 px-2 py-0.5 text-[10px] font-bold text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-md"
+                        >
+                          {editingLabelsRuleId === rule.id ? 'Done' : `Fields (${rule.labels.length})`}
+                        </button>
+                      )}
                     </div>
+
+                    {rule.labels && rule.enabled && editingLabelsRuleId === rule.id && (
+                      <div className="p-2.5 rounded-xl border border-teal-200 bg-teal-50/40 space-y-2">
+                        <p className="text-[10px] text-slate-500">
+                          Values next to or under these labels are redacted. Matching tolerates small OCR
+                          misreads, and a label also covers longer ones that start with it ("Nama" covers "Nama Atasan").
+                        </p>
+                        <div className="flex flex-wrap gap-1">
+                          {rule.labels.map(label => (
+                            <span
+                              key={label}
+                              className="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 text-[10px] font-semibold text-teal-900 bg-white border border-teal-200 rounded-full"
+                            >
+                              {label}
+                              <button
+                                onClick={() => handleRemoveSensitiveLabel(rule.id, label)}
+                                className="text-teal-400 hover:text-rose-600"
+                                title={`Stop redacting values of "${label}"`}
+                              >
+                                <X size={10} />
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            value={newSensitiveLabel}
+                            onChange={(e) => setNewSensitiveLabel(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleAddSensitiveLabel(rule.id);
+                            }}
+                            placeholder="Add a field label, e.g. Nama Ayah"
+                            className="flex-1 px-2.5 py-1.5 text-xs bg-white border border-teal-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-500"
+                          />
+                          <button
+                            onClick={() => handleAddSensitiveLabel(rule.id)}
+                            className="px-2.5 py-1.5 text-xs font-bold text-white bg-teal-600 hover:bg-teal-700 rounded-lg"
+                          >
+                            Add
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    </React.Fragment>
                   ))}
                 </div>
 
@@ -2560,7 +2664,7 @@ const PdfRedactor: React.FC = () => {
           }}
         >
           <div
-            className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-6xl h-[92vh] flex flex-col overflow-hidden text-slate-800"
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-[96vw] h-[94vh] flex flex-col overflow-hidden text-slate-800"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
@@ -2725,11 +2829,11 @@ const PdfRedactor: React.FC = () => {
                         <ZoomIn size={13} />
                       </button>
                       {activeImageModalMatch.imagePixelWidth &&
-                        activeImageModalMatch.imagePixelWidth > 680 && (
+                        activeImageModalMatch.imagePixelWidth > modalFitWidth && (
                           <button
                             onClick={() => {
                               const natRatio = Number(
-                                (activeImageModalMatch.imagePixelWidth! / 680).toFixed(2)
+                                (activeImageModalMatch.imagePixelWidth! / modalFitWidth).toFixed(2)
                               );
                               setModalImageZoom(z => (Math.abs(z - natRatio) < 0.1 ? 1.0 : Math.min(4.0, natRatio)));
                             }}
@@ -2761,7 +2865,7 @@ const PdfRedactor: React.FC = () => {
                       handleModalImageMouseDown(e);
                     }
                   }}
-                  className={`flex-1 overflow-auto p-4 sm:p-6 min-h-0 select-none ${
+                  className={`flex-1 overflow-auto scrollbar-gutter-stable p-4 sm:p-6 min-h-0 select-none ${
                     modalInteractionMode === 'pan'
                       ? modalPanState
                         ? 'cursor-grabbing'
@@ -2805,9 +2909,7 @@ const PdfRedactor: React.FC = () => {
                           alt="Full-Size Extracted PDF Image"
                           draggable={false}
                           style={{
-                            width: activeImageModalMatch.imagePixelWidth
-                              ? `${Math.round(Math.min(activeImageModalMatch.imagePixelWidth, 680) * modalImageZoom)}px`
-                              : `${Math.round(680 * modalImageZoom)}px`,
+                            width: `${Math.round(modalFitWidth * modalImageZoom)}px`,
                             maxWidth: 'none',
                             height: 'auto',
                             maxHeight: 'none'
@@ -2854,10 +2956,25 @@ const PdfRedactor: React.FC = () => {
                               left: `${box.xRatio * 100}%`,
                               top: `${box.yRatio * 100}%`,
                               width: `${box.wRatio * 100}%`,
-                              height: `${box.hRatio * 100}%`
+                              height: `${box.hRatio * 100}%`,
+                              // A selected face shows its real pixelated crop from the redacted image. A static
+                              // background, not a backdrop blur: blur filters flicker in Chrome scroll areas.
+                              ...(box.fieldType === 'face' && box.selected && activeImageModalMatch.redactedImageDataUrl
+                                ? {
+                                    backgroundImage: `url(${activeImageModalMatch.redactedImageDataUrl})`,
+                                    backgroundSize: `${100 / box.wRatio}% ${100 / box.hRatio}%`,
+                                    backgroundPosition: `${box.wRatio < 1 ? (box.xRatio / (1 - box.wRatio)) * 100 : 0}% ${
+                                      box.hRatio < 1 ? (box.yRatio / (1 - box.hRatio)) * 100 : 0
+                                    }%`
+                                  }
+                                : {})
                             }}
                             className={`group transition-all flex items-center justify-center cursor-pointer rounded-xs border overflow-hidden ${
-                              box.selected
+                              box.fieldType === 'face'
+                                ? box.selected
+                                  ? 'border-fuchsia-500 shadow-2xs'
+                                  : 'bg-fuchsia-500/10 border-dashed border-fuchsia-400 hover:bg-rose-500/25 hover:border-rose-400'
+                                : box.selected
                                 ? redactionOptions.mode === 'blackout'
                                   ? 'bg-neutral-950 border-rose-500 text-white shadow-2xs'
                                   : redactionOptions.mode === 'whiteout'
@@ -2877,7 +2994,7 @@ const PdfRedactor: React.FC = () => {
                               box.pairedLabel ? ` (Input for ${box.pairedLabel})` : ''
                             } — Click to ${box.selected ? 'keep readable' : 'redact'}`}
                           >
-                            {box.selected && (
+                            {box.selected && box.fieldType !== 'face' && (
                               <span className="text-[8px] sm:text-[9px] leading-none font-mono font-bold px-0.5 truncate pointer-events-none tracking-tight">
                                 {redactionOptions.mode === 'replacement_text'
                                   ? redactionOptions.replacementText
@@ -3081,14 +3198,18 @@ const PdfRedactor: React.FC = () => {
                                 {box.fieldType && (
                                   <span
                                     className={`text-[9px] font-bold uppercase px-1.2 py-0.2 rounded shrink-0 ${
-                                      box.fieldType === 'input_value'
+                                      box.fieldType === 'face'
+                                        ? 'bg-fuchsia-100 text-fuchsia-800 border border-fuchsia-200'
+                                        : box.fieldType === 'input_value'
                                         ? 'bg-indigo-100 text-indigo-800 border border-indigo-200'
                                         : box.fieldType === 'label'
                                         ? 'bg-amber-100 text-amber-800 border border-amber-200'
                                         : 'bg-slate-200 text-slate-700'
                                     }`}
                                   >
-                                    {box.fieldType === 'input_value'
+                                    {box.fieldType === 'face'
+                                      ? 'Face'
+                                      : box.fieldType === 'input_value'
                                       ? 'Input Value'
                                       : box.fieldType === 'label'
                                       ? 'Form Label'
